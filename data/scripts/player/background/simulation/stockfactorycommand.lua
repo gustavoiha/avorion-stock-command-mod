@@ -724,11 +724,11 @@ end
 
 function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
     if not config or not config.target then
-        return "Select one of your stations to stock."%_t
+        return "You haven't picked a station for me to keep stocked. Select one of your stations in this sector first."%_t
     end
 
     if not config.goods or #config.goods == 0 then
-        return "Select at least one good to stock."%_t
+        return "You haven't selected any goods for me to stock. Tick at least one of the goods the station needs before I can start."%_t
     end
 
     local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
