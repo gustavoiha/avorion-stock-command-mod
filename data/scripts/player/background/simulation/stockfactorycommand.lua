@@ -545,10 +545,6 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     local owner = getParentFaction()
     local haul = self.data.currentHaul
 
-    if (added or 0) > 0 then
-        owner:sendChatMessage("", ChatMessageType.Economy, "'%1%' delivered %2% %3% to '%4%'."%_T, self.shipName, added, goodDisplayName(good, added), self.data.target.name)
-    end
-
     -- if the target had less room than expected (e.g. another ship delivered in
     -- the meantime), return the leftover goods to the source instead of losing them
     if haul and (notAdded or 0) > 0 then
