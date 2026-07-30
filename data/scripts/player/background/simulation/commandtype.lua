@@ -1,0 +1,11 @@
+-- Stock Factory mod — extends the vanilla command-type registry.
+--
+-- This file name-clashes with the vanilla
+--   data/scripts/player/background/simulation/commandtype.lua
+-- so Avorion injects this code *before* that file's final `return CommandType`.
+-- That means the file-local `CommandType` table is already in scope here, and we
+-- can simply add our new command type to it without editing the vanilla file.
+--
+-- The UUID must never change once ships have started using the command, otherwise
+-- the game treats it as a different command and stops existing ones.
+CommandType.StockFactory = "5e2a9c74-8f6b-4d13-a0c5-7b9e1f2d3a48"
