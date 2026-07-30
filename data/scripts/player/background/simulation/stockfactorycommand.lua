@@ -16,7 +16,7 @@ StockFactoryCommand.__index = StockFactoryCommand
 StockFactoryCommand.type = CommandType.StockFactory
 
 -- how many goods can be shown in the config checklist
-local MaxGoodCheckboxes = 12
+local MaxGoodCheckboxes = 20
 
 -- how many sectors to scan around the target (Euclidean radius) for the "2.5
 -- sectors away" rule, and how many consecutive gate jumps for the alternative rule
@@ -872,12 +872,12 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.orderName = "Stock Factory"%_t
     ui.icon = StockFactoryCommand:getIcon()
 
-    local size = vec2(700, 640)
+    local size = vec2(700, 720)
 
     ui.window = GalaxyMap():createWindow(Rect(size))
     ui.window.caption = "Stock Factory"%_t
 
-    local settings = {areaHeight = 110, configHeight = 250, hideEscortUI = true}
+    local settings = {areaHeight = 110, configHeight = 290, hideEscortUI = true}
     ui.commonUI = SimulationUtility.buildCommandUI(ui.window, startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback, settings)
 
     -- config: target station + goods checklist
