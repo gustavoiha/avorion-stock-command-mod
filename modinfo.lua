@@ -24,7 +24,7 @@ meta =
     authors = {"Gugs_Iha"},
 
     -- Version (major.minor[.patch]).
-    version = "1.0",
+    version = "1.1",
 
     -- Dependencies. Left empty on purpose so the mod isn't tied to a specific
     -- Avorion patch version.
