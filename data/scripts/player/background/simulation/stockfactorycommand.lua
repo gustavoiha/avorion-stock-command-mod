@@ -703,7 +703,8 @@ end
 ---------------------------------------------------------------------
 
 function StockFactoryCommand:getDescriptionText()
-    return "The ship keeps a station stocked with the goods it needs, fetching them from your own nearby stations."%_t
+    local station = (self.data and self.data.target and self.data.target.name) or self.config.target or ""
+    return "The ship is keeping the station '${station}' stocked, ferrying the goods it needs from your own nearby stations."%_T, {station = station}
 end
 
 function StockFactoryCommand:getStatusMessage()
@@ -879,6 +880,22 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     local settings = {areaHeight = 110, configHeight = 290, hideEscortUI = true}
     ui.commonUI = SimulationUtility.buildCommandUI(ui.window, startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback, settings)
+
+    -- brief "how it works" description, shown in the top-right panel (the space
+    -- normally used by the escort UI, which this command hides)
+    local descRect = ui.commonUI.escortRect
+    ui.window:createFrame(descRect)
+    local descOrganizer = UIOrganizer(descRect)
+    descOrganizer.margin = 6
+    ui.descriptionField = ui.window:createTextField(descOrganizer.inner, "")
+    ui.descriptionField.font = FontType.Normal
+    ui.descriptionField.fontSize = 12
+    ui.descriptionField.fontColor = ColorRGB(0.7, 0.7, 0.7)
+    ui.descriptionField.padding = 4
+    ui.descriptionField.text =
+        "Keeps the selected station stocked."%_t .. "\n\n" ..
+        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and lie within 2.5 sectors or 3 gate jumps."%_t .. "\n\n" ..
+        "It never hauls more than the station needs, and never takes a good from a station that also buys it."%_t
 
     -- config: target station + goods checklist
     local configRect = ui.commonUI.configRect
