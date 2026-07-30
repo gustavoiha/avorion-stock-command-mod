@@ -683,7 +683,12 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
     local reachable = computeReachableRegion(sx, sy)
     results.reachable = reachable
 
-    -- let the appearance system show the ferry anywhere in its operating region
+    -- let the appearance system show the ferry anywhere in its operating region.
+    -- each entry is flagged `hidden = true` so the vanilla map highlighter
+    -- (MapCommands.highlightReachableSectors) skips it and doesn't clutter the
+    -- galaxy map with green squares — while ShipAppearances.findLocation, which
+    -- ignores that flag, can still pick these sectors to show the moving ferry.
+    -- This mirrors how vanilla's travelcommand.lua hides its route.
     results.reachableCoordinates = results.reachableCoordinates or {}
     local existing = {}
     for _, coord in pairs(results.reachableCoordinates) do
@@ -694,7 +699,7 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
             local sep = string.find(key, ":")
             local kx = tonumber(string.sub(key, 1, sep - 1))
             local ky = tonumber(string.sub(key, sep + 1))
-            table.insert(results.reachableCoordinates, {x = kx, y = ky, faction = 0})
+            table.insert(results.reachableCoordinates, {x = kx, y = ky, faction = 0, hidden = true})
         end
     end
 end
