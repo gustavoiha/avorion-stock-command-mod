@@ -196,6 +196,7 @@ end
 
 -- returns the list of owned stations that can supply the given good:
 --  - in range of the target (2.5 sectors or <= 3 gate jumps)
+--  - in a DIFFERENT sector than the target (no point stocking from the same sector)
 --  - they SELL the good
 --  - they do NOT also buy the good (prevents loops / stealing from other factories)
 function StockFactoryCommand:eligibleSources(good)
@@ -205,6 +206,7 @@ function StockFactoryCommand:eligibleSources(good)
 
     for _, st in pairs(self.data.stations or {}) do
         if st.name ~= target.name
+            and not (st.x == target.x and st.y == target.y)
             and reachable[skey(st.x, st.y)]
             and st.sells and st.sells[good]
             and not (st.buys and st.buys[good]) then
@@ -800,6 +802,7 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
             if isGoodEligible(good) then
                 for _, st in pairs(stations) do
                     if st.name ~= target.name
+                        and not (st.x == target.x and st.y == target.y)
                         and reachable[skey(st.x, st.y)]
                         and st.sells and st.sells[good]
                         and not (st.buys and st.buys[good]) then
