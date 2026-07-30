@@ -26,6 +26,9 @@ local MaxGateJumps = 3
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
 
+-- how often (seconds) the command re-scans reachable suppliers and the gate route
+local RemapInterval = 5 * 60
+
 
 ---------------------------------------------------------------------
 -- small helpers
@@ -108,17 +111,20 @@ function StockFactoryCommand:onStart()
     local tx, ty = target:getCoordinates()
     self.data.target = {name = self.config.target, x = tx, y = ty}
 
-    -- cache the station list + reachable region that was computed during the area
-    -- analysis, so the ferry logic has it available (and it's saved to database)
+    -- cache the station list + reachable region + gate route that were computed
+    -- during the area analysis, so the ferry logic has them available (all saved
+    -- to the database)
     local analysis = self.area and self.area.analysis or {}
     self.data.stations = analysis.stations or {}
     self.data.reachable = analysis.reachable or {}
+    self.data.gateCameFrom = analysis.gateCameFrom or {}
 
     self.data.phase = "idle"
     self.data.timer = 0
     self.data.rescanCooldown = 0
     self.data.cursor = 0
     self.data.sourceCursor = 0
+    self.data.remapCooldown = RemapInterval
 
     local entry = ShipDatabaseEntry(owner.index, self.shipName)
     entry:setStatusMessage("Stocking a station"%_T)
@@ -128,6 +134,19 @@ function StockFactoryCommand:update(timeStep)
     if self.finishOnNextUpdate then
         self:finish()
         return
+    end
+
+    -- periodically re-scan the reachable suppliers + gate route so the command
+    -- follows the galaxy (gates turning hostile, suppliers built or destroyed).
+    -- Recalls the ship if it can no longer do the job.
+    self.data.remapCooldown = (self.data.remapCooldown or RemapInterval) - timeStep
+    if self.data.remapCooldown <= 0 then
+        self.data.remapCooldown = RemapInterval
+        self:remapRoute()
+        if self.finishOnNextUpdate then
+            self:finish()
+            return
+        end
     end
 
     self.data.timer = (self.data.timer or 0) + timeStep
@@ -568,9 +587,14 @@ function StockFactoryCommand:onAreaAnalysisSector(results, meta, x, y)
 end
 
 -- BFS over the gate network from the origin sector, up to MaxGateJumps hops,
--- plus every sector within SectorRadius (Euclidean) of the origin.
-local function computeReachableRegion(originX, originY)
+-- plus every sector within SectorRadius (Euclidean) of the origin. Returns the
+-- reachable set AND a gate-predecessor map (cameFrom[sectorKey] = the sector one
+-- gate hop closer to the origin) used to retrace the exact gate route. Gate hops
+-- into sectors controlled by a faction we're at war with are skipped, so a gate
+-- turning hostile cuts that branch off the route.
+local function computeReachableRegion(owner, originX, originY)
     local reachable = {}
+    local cameFrom = {}
     local count = 0
 
     local function add(x, y)
@@ -581,7 +605,15 @@ local function computeReachableRegion(originX, originY)
         end
     end
 
-    -- "2.5 sectors away" disk
+    local function sectorBlocked(x, y)
+        if not owner then return false end
+        local faction = Galaxy():getControllingFaction(x, y)
+        if not faction or faction.index == owner.index then return false end
+        local ok, status = pcall(function() return owner:getRelationStatus(faction.index) end)
+        return ok and status == RelationStatus.War
+    end
+
+    -- "2.5 sectors away" disk (a normal hyperspace jump)
     local r = math.ceil(SectorRadius)
     for dx = -r, r do
         for dy = -r, r do
@@ -591,9 +623,12 @@ local function computeReachableRegion(originX, originY)
         end
     end
 
-    -- "3 consecutive gate jumps" flood fill
+    -- "3 consecutive gate jumps" flood fill, with its own visited set so gate paths
+    -- passing through jump-disk sectors are still followed and recorded
     local ok, gatesMap = pcall(function() return GatesMap(Server().seed) end)
     if ok and gatesMap then
+        local originKey = skey(originX, originY)
+        local gateVisited = {[originKey] = true}
         local frontier = {{x = originX, y = originY}}
 
         for jump = 1, MaxGateJumps do
@@ -606,10 +641,16 @@ local function computeReachableRegion(originX, originY)
 
                 for _, coord in pairs(connected) do
                     local key = skey(coord.x, coord.y)
-                    if not reachable[key] then
-                        add(coord.x, coord.y)
-                        table.insert(nextFrontier, coord)
-                        if count >= MaxReachableSectors then return reachable end
+                    if not gateVisited[key] then
+                        gateVisited[key] = true
+                        if not sectorBlocked(coord.x, coord.y) then
+                            cameFrom[key] = {x = sector.x, y = sector.y}
+                            add(coord.x, coord.y)
+                            table.insert(nextFrontier, coord)
+                            if count >= MaxReachableSectors then
+                                return reachable, cameFrom
+                            end
+                        end
                     end
                 end
             end
@@ -618,13 +659,12 @@ local function computeReachableRegion(originX, originY)
         end
     end
 
-    return reachable
+    return reachable, cameFrom
 end
 
-function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
-    local owner = Galaxy():findFaction(meta.factionIndex)
+-- gathers the owner's stations that trade goods, with their buy/sell trade scripts
+local function gatherOwnedTradingStations(owner)
     local tradeScripts = TradingUtility.getTradeableScripts()
-
     local stations = {}
 
     for _, name in pairs({owner:getShipNames()}) do
@@ -675,13 +715,20 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
         end
     end
 
-    results.stations = stations
+    return stations
+end
+
+function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
+    local owner = Galaxy():findFaction(meta.factionIndex)
+
+    results.stations = gatherOwnedTradingStations(owner)
 
     -- reachable region around the ship's sector (which is also the target's sector,
     -- since only stations in the ship's sector can be selected as target)
     local sx, sy = meta.faction:getShipPosition(meta.shipName)
-    local reachable = computeReachableRegion(sx, sy)
+    local reachable, gateCameFrom = computeReachableRegion(owner, sx, sy)
     results.reachable = reachable
+    results.gateCameFrom = gateCameFrom
 
     -- let the appearance system show the ferry anywhere in its operating region.
     -- each entry is flagged `hidden = true` so the vanilla map highlighter
@@ -702,6 +749,146 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
             table.insert(results.reachableCoordinates, {x = kx, y = ky, faction = 0, hidden = true})
         end
     end
+end
+
+
+---------------------------------------------------------------------
+-- periodic re-mapping + failure handling
+---------------------------------------------------------------------
+
+-- true if at least one selected good can still be sourced from a reachable owned
+-- supplier (i.e. the command can still do its job at all)
+function StockFactoryCommand:hasAnyReachableSource()
+    for _, good in pairs(self.config.goods or {}) do
+        if isGoodEligible(good) and #self:eligibleSources(good) > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+-- re-scan owned stations and recompute the reachable region + gate route from the
+-- target, so the command follows the galaxy over time (gates turning hostile,
+-- suppliers built or destroyed). If nothing can be reached any more the ship can't
+-- keep the order, so it is stopped and recalled.
+function StockFactoryCommand:remapRoute()
+    local owner = getParentFaction()
+    local target = self.data.target
+    if not owner or not target then return end
+
+    local targetEntry = ShipDatabaseEntry(owner.index, target.name)
+    if not valid(targetEntry) or targetEntry:getEntityType() ~= EntityType.Station then
+        self:setRuntimeError("Commander, the station '%s' we were stocking is gone. Recalling."%_T, target.name)
+        return
+    end
+
+    local tx, ty = targetEntry:getCoordinates()
+    self.data.target.x = tx
+    self.data.target.y = ty
+
+    self.data.stations = gatherOwnedTradingStations(owner)
+
+    local reachable, gateCameFrom = computeReachableRegion(owner, tx, ty)
+    self.data.reachable = reachable
+    self.data.gateCameFrom = gateCameFrom
+
+    if not self:hasAnyReachableSource() then
+        self:setRuntimeError("Commander, we can no longer reach a supplier for '%s' -- the route is cut off or the suppliers are gone. Recalling."%_T, target.name)
+    end
+end
+
+
+---------------------------------------------------------------------
+-- ferry route queries (which gate the visible ferry should fly through)
+---------------------------------------------------------------------
+
+-- runs inside the loaded sector: hands the computed next hop to the ferry appearance
+local ferryReplyCode = [[
+package.path = package.path .. ";data/scripts/lib/?.lua"
+include("utility")
+
+function run(faction, shipName, nextX, nextY, useGate)
+    for _, entity in pairs({Sector():getEntitiesByScriptValue("displayed_faction")}) do
+        if entity:getValue("displayed_faction") == faction and entity.name == shipName then
+            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate)
+        end
+    end
+end
+]]
+
+-- walk the saved gate-predecessor map from a source back towards the target; the
+-- node whose predecessor IS the target is the first gate hop out of the target
+local function firstGateHopFromTarget(cameFrom, targetKey, sx, sy)
+    local node = {x = sx, y = sy}
+    local nodeKey = skey(sx, sy)
+
+    for _ = 1, MaxGateJumps + 1 do
+        local pred = cameFrom[nodeKey]
+        if not pred then return nil end
+        if skey(pred.x, pred.y) == targetKey then
+            return node
+        end
+        node = pred
+        nodeKey = skey(pred.x, pred.y)
+    end
+
+    return nil
+end
+
+-- a gate-reachable supplier (for a selected good) the ferry can head to from the target
+function StockFactoryCommand:pickGateReachableSource()
+    local cameFrom = self.data.gateCameFrom or {}
+
+    for _, good in pairs(self.config.goods or {}) do
+        if isGoodEligible(good) then
+            for _, st in pairs(self:eligibleSources(good)) do
+                if cameFrom[skey(st.x, st.y)] then
+                    return st
+                end
+            end
+        end
+    end
+end
+
+-- given the sector a ferry is in, return the next sector it should head towards
+-- (one gate hop) and whether that hop uses a gate. Hub-and-spoke loop:
+-- target -> supplier -> target -> ...
+function StockFactoryCommand:computeFerryNextHop(sx, sy)
+    local target = self.data.target
+    if not target then return nil, nil, false end
+
+    local cameFrom = self.data.gateCameFrom or {}
+    local targetKey = skey(target.x, target.y)
+    local currentKey = skey(sx, sy)
+
+    if currentKey == targetKey then
+        -- sitting at the target: leave towards a gate-reachable supplier
+        local source = self:pickGateReachableSource()
+        if not source then return nil, nil, false end
+
+        local hop = firstGateHopFromTarget(cameFrom, targetKey, source.x, source.y)
+        if hop then return hop.x, hop.y, true end
+        return nil, nil, false
+    end
+
+    -- sitting at a supplier (or anywhere gate-reachable): head back towards the
+    -- target, one gate hop at a time
+    local pred = cameFrom[currentKey]
+    if pred then return pred.x, pred.y, true end
+
+    return nil, nil, false
+end
+
+-- invoked by the ferry appearance to learn which gate to use; replies straight
+-- back into the ferry's sector via runSectorCode
+function StockFactoryCommand:onFerryRouteRequest(sx, sy)
+    local owner = getParentFaction()
+    if not owner then return end
+
+    local nextX, nextY, useGate = self:computeFerryNextHop(sx, sy)
+
+    runSectorCode(sx, sy, true, ferryReplyCode, "run", owner.index, self.shipName,
+        nextX or 0, nextY or 0, useGate and true or false)
 end
 
 
