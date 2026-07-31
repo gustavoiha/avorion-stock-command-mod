@@ -19,9 +19,8 @@ StockFactoryCommand.type = CommandType.StockFactory
 local MaxGoodCheckboxes = 20
 
 -- how many sectors to scan around the target (Euclidean radius) for the "2.5
--- sectors away" rule, and how many consecutive gate jumps for the alternative rule
+-- sectors away" rule; gate-connected suppliers are reachable regardless of distance
 local SectorRadius = 2.5
-local MaxGateJumps = 3
 
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
@@ -214,7 +213,7 @@ function StockFactoryCommand:targetScriptFor(good)
 end
 
 -- returns the list of owned stations that can supply the given good:
---  - in range of the target (2.5 sectors or <= 3 gate jumps)
+--  - in range of the target (2.5 sectors or connected by any chain of gates)
 --  - in a DIFFERENT sector than the target (no point stocking from the same sector)
 --  - they SELL the good
 --  - they do NOT also buy the good (prevents loops / stealing from other factories)
@@ -582,12 +581,12 @@ end
 function StockFactoryCommand:onAreaAnalysisSector(results, meta, x, y)
 end
 
--- BFS over the gate network from the origin sector, up to MaxGateJumps hops,
--- plus every sector within SectorRadius (Euclidean) of the origin. Returns the
--- reachable set AND a gate-predecessor map (cameFrom[sectorKey] = the sector one
--- gate hop closer to the origin) used to retrace the exact gate route. Gate hops
--- into sectors controlled by a faction we're at war with are skipped, so a gate
--- turning hostile cuts that branch off the route.
+-- BFS over the gate network from the origin sector, following the gate graph as
+-- far as it reaches, plus every sector within SectorRadius (Euclidean) of the
+-- origin. Returns the reachable set AND a gate-predecessor map (cameFrom[sectorKey]
+-- = the sector one gate hop closer to the origin) used to retrace the exact gate
+-- route. Gate hops into sectors controlled by a faction we're at war with are
+-- skipped, so a gate turning hostile cuts that branch off the route.
 local function computeReachableRegion(owner, originX, originY)
     local reachable = {}
     local cameFrom = {}
@@ -619,15 +618,16 @@ local function computeReachableRegion(owner, originX, originY)
         end
     end
 
-    -- "3 consecutive gate jumps" flood fill, with its own visited set so gate paths
-    -- passing through jump-disk sectors are still followed and recorded
+    -- unbounded gate flood fill, with its own visited set so gate paths passing
+    -- through jump-disk sectors are still followed and recorded. Follows the gate
+    -- graph until it is fully explored (or the safety cap is hit).
     local ok, gatesMap = pcall(function() return GatesMap(Server().seed) end)
     if ok and gatesMap then
         local originKey = skey(originX, originY)
         local gateVisited = {[originKey] = true}
         local frontier = {{x = originX, y = originY}}
 
-        for jump = 1, MaxGateJumps do
+        while #frontier > 0 do
             local nextFrontier = {}
 
             for _, sector in pairs(frontier) do
@@ -818,7 +818,8 @@ local function firstGateHopFromTarget(cameFrom, targetKey, sx, sy)
     local node = {x = sx, y = sy}
     local nodeKey = skey(sx, sy)
 
-    for _ = 1, MaxGateJumps + 1 do
+    -- bounded by the reachable-region safety cap so a corrupt map can't loop forever
+    for _ = 1, MaxReachableSectors do
         local pred = cameFrom[nodeKey]
         if not pred then return nil end
         if skey(pred.x, pred.y) == targetKey then
@@ -1085,7 +1086,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
         "Keeps the selected station stocked."%_t .. "\n\n" ..
-        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and lie within 2.5 sectors or 3 gate jumps."%_t .. "\n\n" ..
+        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and lie within 2.5 sectors or are connected by gates."%_t .. "\n\n" ..
         "It never hauls more than the station needs, and never takes a good from a station that also buys it."%_t
 
     -- config: target station + goods checklist
