@@ -18,9 +18,10 @@ StockFactoryCommand.type = CommandType.StockFactory
 -- how many goods can be shown in the config checklist
 local MaxGoodCheckboxes = 20
 
--- how many sectors to scan around the target (Euclidean radius) for the "2.5
--- sectors away" rule; gate-connected suppliers are reachable regardless of distance
-local SectorRadius = 2.5
+-- suppliers are reached purely through the gate network; cycle time is modelled
+-- per gate jump between the target and the supplier, plus a fixed docking overhead
+local SecondsPerGateJump = 45
+local DockingSeconds = 120
 
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
@@ -117,6 +118,7 @@ function StockFactoryCommand:onStart()
     self.data.stations = analysis.stations or {}
     self.data.reachable = analysis.reachable or {}
     self.data.gateCameFrom = analysis.gateCameFrom or {}
+    self.data.gateDepth = analysis.gateDepth or {}
 
     self.data.phase = "idle"
     self.data.timer = 0
@@ -213,7 +215,7 @@ function StockFactoryCommand:targetScriptFor(good)
 end
 
 -- returns the list of owned stations that can supply the given good:
---  - in range of the target (2.5 sectors or connected by any chain of gates)
+--  - connected to the target through the gate network (no empty-space jumps)
 --  - in a DIFFERENT sector than the target (no point stocking from the same sector)
 --  - they SELL the good
 --  - they do NOT also buy the good (prevents loops / stealing from other factories)
@@ -235,21 +237,13 @@ function StockFactoryCommand:eligibleSources(good)
     return result
 end
 
-function StockFactoryCommand:estimateTravelTime(owner, source)
-    local ship = ShipDatabaseEntry(owner.index, self.shipName)
-
-    local range = 45
-    if valid(ship) then
-        local reach = ship:getHyperspaceProperties()
-        if reach and reach > 1 then range = reach end
-    end
-
-    local t = self.data.target
-    local dist = math.sqrt((t.x - source.x) ^ 2 + (t.y - source.y) ^ 2)
-    local jumps = math.max(1, math.ceil(dist / range))
-    local minutes = math.ceil(jumps * 45 / 60) + 2 -- + docking time
-
-    return minutes * 60
+-- travel time for one leg of the haul, modelled from the number of gate jumps
+-- between the target and the supplier (recorded during the reachable-region BFS)
+-- plus a fixed docking overhead. Distance through empty space is irrelevant here.
+function StockFactoryCommand:estimateTravelTime(source)
+    local depthMap = self.data.gateDepth or {}
+    local jumps = math.max(1, depthMap[skey(source.x, source.y)] or 1)
+    return jumps * SecondsPerGateJump + DockingSeconds
 end
 
 function StockFactoryCommand:planNextHaul()
@@ -298,7 +292,7 @@ function StockFactoryCommand:planNextHaul()
                         script = source.sells[good],
                     },
                     targetScript = self:targetScriptFor(good),
-                    travelTime = self:estimateTravelTime(owner, source),
+                    travelTime = self:estimateTravelTime(source),
                 }
 
                 self.data.phase = "hauling"
@@ -582,14 +576,17 @@ function StockFactoryCommand:onAreaAnalysisSector(results, meta, x, y)
 end
 
 -- BFS over the gate network from the origin sector, following the gate graph as
--- far as it reaches, plus every sector within SectorRadius (Euclidean) of the
--- origin. Returns the reachable set AND a gate-predecessor map (cameFrom[sectorKey]
--- = the sector one gate hop closer to the origin) used to retrace the exact gate
--- route. Gate hops into sectors controlled by a faction we're at war with are
--- skipped, so a gate turning hostile cuts that branch off the route.
+-- far as it reaches. Suppliers are only reachable through gates -- empty-space
+-- jumps are NOT considered. Returns the reachable set, a gate-predecessor map
+-- (cameFrom[sectorKey] = the sector one gate hop closer to the origin) used to
+-- retrace the exact gate route, and a gate-depth map (depth[sectorKey] = number
+-- of gate jumps from the origin) used to model cycle time. Gate hops into sectors
+-- controlled by a faction we're at war with are skipped, so a gate turning hostile
+-- cuts that branch off the route.
 local function computeReachableRegion(owner, originX, originY)
     local reachable = {}
     local cameFrom = {}
+    local gateDepth = {}
     local count = 0
 
     local function add(x, y)
@@ -608,26 +605,22 @@ local function computeReachableRegion(owner, originX, originY)
         return ok and status == RelationStatus.War
     end
 
-    -- "2.5 sectors away" disk (a normal hyperspace jump)
-    local r = math.ceil(SectorRadius)
-    for dx = -r, r do
-        for dy = -r, r do
-            if dx * dx + dy * dy <= SectorRadius * SectorRadius then
-                add(originX + dx, originY + dy)
-            end
-        end
-    end
+    -- the origin (target) sector itself is part of the operating region
+    add(originX, originY)
 
-    -- unbounded gate flood fill, with its own visited set so gate paths passing
-    -- through jump-disk sectors are still followed and recorded. Follows the gate
-    -- graph until it is fully explored (or the safety cap is hit).
+    -- unbounded gate flood fill. Follows the gate graph outward from the origin,
+    -- recording how many gate jumps each sector is away, until it is fully
+    -- explored (or the safety cap is hit).
     local ok, gatesMap = pcall(function() return GatesMap(Server().seed) end)
     if ok and gatesMap then
         local originKey = skey(originX, originY)
         local gateVisited = {[originKey] = true}
+        gateDepth[originKey] = 0
         local frontier = {{x = originX, y = originY}}
+        local depth = 0
 
         while #frontier > 0 do
+            depth = depth + 1
             local nextFrontier = {}
 
             for _, sector in pairs(frontier) do
@@ -641,10 +634,11 @@ local function computeReachableRegion(owner, originX, originY)
                         gateVisited[key] = true
                         if not sectorBlocked(coord.x, coord.y) then
                             cameFrom[key] = {x = sector.x, y = sector.y}
+                            gateDepth[key] = depth
                             add(coord.x, coord.y)
                             table.insert(nextFrontier, coord)
                             if count >= MaxReachableSectors then
-                                return reachable, cameFrom
+                                return reachable, cameFrom, gateDepth
                             end
                         end
                     end
@@ -655,7 +649,7 @@ local function computeReachableRegion(owner, originX, originY)
         end
     end
 
-    return reachable, cameFrom
+    return reachable, cameFrom, gateDepth
 end
 
 -- gathers the owner's stations that trade goods, with their buy/sell trade scripts
@@ -722,9 +716,10 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
     -- reachable region around the ship's sector (which is also the target's sector,
     -- since only stations in the ship's sector can be selected as target)
     local sx, sy = meta.faction:getShipPosition(meta.shipName)
-    local reachable, gateCameFrom = computeReachableRegion(owner, sx, sy)
+    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, sx, sy)
     results.reachable = reachable
     results.gateCameFrom = gateCameFrom
+    results.gateDepth = gateDepth
 
     -- let the appearance system show the ferry anywhere in its operating region.
     -- each entry is flagged `hidden = true` so the vanilla map highlighter
@@ -784,9 +779,10 @@ function StockFactoryCommand:remapRoute()
 
     self.data.stations = gatherOwnedTradingStations(owner)
 
-    local reachable, gateCameFrom = computeReachableRegion(owner, tx, ty)
+    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, tx, ty)
     self.data.reachable = reachable
     self.data.gateCameFrom = gateCameFrom
+    self.data.gateDepth = gateDepth
 
     if not self:hasAnyReachableSource() then
         self:setRuntimeError("Commander, we can no longer reach a supplier for '%s' -- the route is cut off or the suppliers are gone. Recalling."%_T, target.name)
@@ -1086,7 +1082,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
         "Keeps the selected station stocked."%_t .. "\n\n" ..
-        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and lie within 2.5 sectors or are connected by gates."%_t .. "\n\n" ..
+        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and are connected to it through the gate network."%_t .. "\n\n" ..
         "It never hauls more than the station needs, and never takes a good from a station that also buys it."%_t
 
     -- config: target station + goods checklist
