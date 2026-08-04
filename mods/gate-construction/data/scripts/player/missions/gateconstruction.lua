@@ -29,39 +29,13 @@ local function missionKey(missionId)
     return missionKeyPrefix .. tostring(missionId)
 end
 
-local spawnCargoCode = [[
-package.path = package.path .. ";data/scripts/lib/?.lua"
-package.path = package.path .. ";data/scripts/?.lua"
-
-include("galaxy")
-include("randomext")
-local ShipGenerator = include("shipgenerator")
-
-function run(playerIndex, key, factionIndex, goodsName, goodsAmount)
-    local x, y = Sector():getCoordinates()
-    local faction = Faction(factionIndex) or Galaxy():getNearestFaction(x, y)
-    if not faction then return end
-
-    local volume = Balancing_GetSectorShipVolume(x, y)
-    local ship = ShipGenerator.createFreighterShip(faction, Matrix(), volume)
-
-    ship.title = "Gate Construction Cargo"%_T
-    ship:setValue(key, true)
-    ship:setValue("gate_construction_cargo_ship", true)
-    ship:setValue("gate_construction_goods_name", goodsName)
-    ship:setValue("gate_construction_goods_required", goodsAmount)
-    ship:setValue("gate_construction_goods_delivered", 0)
-    ship:addScriptOnce("data/scripts/entity/utility/gateconstructioncargoship.lua")
-end
-]]
-
 local spawnInactiveGateCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 package.path = package.path .. ";data/scripts/?.lua"
 
 include("galaxy")
 
-function run(key, factionIndex, tx, ty)
+function run(key, factionIndex, tx, ty, missionId)
     local x, y = Sector():getCoordinates()
 
     local faction = Faction(factionIndex) or Galaxy():getNearestFaction(x, y)
@@ -114,6 +88,7 @@ function run(key, factionIndex, tx, ty)
     desc.factionIndex = faction.index
     desc.invincible = true
     desc:addScript("data/scripts/entity/gate.lua")
+    desc:addScriptOnce("data/scripts/entity/utility/gateconstructioninactivegate.lua")
     desc:setValue("ai_no_attack", true)
 
     local wormhole = desc:getComponent(ComponentType.WormHole)
@@ -130,6 +105,8 @@ function run(key, factionIndex, tx, ty)
     if valid(gate) then
         gate:setValue(key, true)
         gate:setValue("gate_construction_inactive_gate", true)
+        gate:setValue("gate_construction_mission_id", missionId)
+        gate:setValue("gate_construction_mission_script", "data/scripts/player/missions/gateconstruction.lua")
     end
 end
 ]]
@@ -168,24 +145,6 @@ function run(key)
 end
 ]]
 
-local updateDeliveredCode = [[
-function run(playerIndex, key, missionId)
-    local delivered = 0
-    local entities = {Sector():getEntitiesByScriptValue(key)}
-
-    for _, entity in pairs(entities) do
-        if valid(entity) and entity:getValue("gate_construction_cargo_ship") then
-            delivered = math.max(delivered, entity:getValue("gate_construction_goods_delivered") or 0)
-        end
-    end
-
-    local player = Player(playerIndex)
-    if player then
-        player:setValue("gate_construction_delivery_" .. tostring(missionId), delivered)
-    end
-end
-]]
-
 local countXsotanCode = [[
 function run(playerIndex, missionId)
     local count = Sector():getNumEntitiesByScriptValue("is_xsotan")
@@ -196,6 +155,29 @@ function run(playerIndex, missionId)
     end
 end
 ]]
+
+function requestActivation(gateIndex)
+    if onClient() then
+        invokeServerFunction("requestActivation", gateIndex)
+        return
+    end
+
+    local c = missionData.custom
+    if not c or c.phase ~= 2 then return end
+
+    local gate = Entity(gateIndex)
+    if not valid(gate) then return end
+    if not gate:getValue("gate_construction_inactive_gate") then return end
+    if gate:getValue("gate_construction_mission_id") ~= c.missionId then return end
+
+    c.activationRequested = true
+    c.activationGateIndex = gateIndex
+
+    Player(callingPlayer):sendChatMessage("Research Station"%_T, ChatMessageType.Information,
+        "The research station has begun the gate activation sequence."%_T)
+    sync()
+end
+callable(nil, "requestActivation")
 
 local spawnInvasionCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
@@ -326,11 +308,11 @@ local function updateObjectivesFromPhase()
 
     if custom.phase == 1 then
         local mins = math.max(1, math.floor((custom.arrivalCountdown or 0) / 60))
-        missionData.description[2] = {text = "Secure sector (${x}:${y}) if hostiles are present. Cargo ship will only enter a clear zone."%_T, arguments = {x = a.x, y = a.y}, bulletPoint = true}
-        missionData.description[3] = {text = "Once secure: wait for cargo ship arrival (${m} min est.)"%_T, arguments = {m = mins}, bulletPoint = true}
+        missionData.description[2] = {text = "Secure sector (${x}:${y}) if hostiles are present. The research station will construct the inactive gate once the area is clear."%_T, arguments = {x = a.x, y = a.y}, bulletPoint = true}
+        missionData.description[3] = {text = "Once secure: wait for the inactive gate to appear (${m} min est.)"%_T, arguments = {m = mins}, bulletPoint = true}
     elseif custom.phase == 2 then
-        missionData.description[2] = {text = "Deliver ${amount} ${good} to the construction cargo ship in (${x}:${y})"%_T, arguments = {amount = custom.goodsAmount, good = custom.goodsName, x = a.x, y = a.y}, bulletPoint = true}
-        missionData.description[3] = {text = "Progress: ${delivered}/${amount}"%_T, arguments = {delivered = custom.goodsDelivered or 0, amount = custom.goodsAmount}, bulletPoint = true}
+        missionData.description[2] = {text = "Interact with the inactive gate in (${x}:${y}) to begin activation."%_T, arguments = {x = a.x, y = a.y}, bulletPoint = true}
+        missionData.description[3] = {text = "The station still requires the full material payment before activation."%_T, bulletPoint = true}
     elseif custom.phase == 3 then
         missionData.description[2] = {text = "Defend the construction site in (${x}:${y}) and destroy all Xsotan."%_T, arguments = {x = a.x, y = a.y}, bulletPoint = true}
     elseif custom.phase == 4 then
@@ -366,15 +348,8 @@ local function spawnInactiveAnchors()
     local c = missionData.custom
     local key = missionKey(c.missionId)
 
-    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointB.x, c.endpointB.y)
-    runSectorCode(c.endpointB.x, c.endpointB.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointA.x, c.endpointA.y)
-end
-
-local function spawnCargoAtDestination()
-    local c = missionData.custom
-    local key = missionKey(c.missionId)
-
-    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnCargoCode, "run", Player().index, key, c.builderFactionIndex, c.goodsName, c.goodsAmount)
+    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointB.x, c.endpointB.y, c.missionId)
+    runSectorCode(c.endpointB.x, c.endpointB.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointA.x, c.endpointA.y, c.missionId)
 end
 
 local function spawnInvasion()
@@ -417,7 +392,6 @@ local function isSectorClearOfHostiles(x, y)
         for _, ship in pairs({Sector():getEntitiesByType(EntityType.Ship)}) do
             if valid(ship)
                     and not ship.playerOrAllianceOwned
-                    and not ship:getValue("gate_construction_cargo_ship")
                     and (ship:getValue("is_xsotan") ~= nil
                         or ship:getValue("is_pirate") ~= nil
                         or ship:getValue("background_attacker") ~= nil) then
@@ -486,12 +460,6 @@ local function clearInactiveAndSpawnActiveGates()
     return true
 end
 
-local function checkDeliveryProgress()
-    local c = missionData.custom
-    runSectorCode(c.endpointA.x, c.endpointA.y, true, updateDeliveredCode, "run", Player().index, missionKey(c.missionId), c.missionId)
-    c.goodsDelivered = Player():getValue("gate_construction_delivery_" .. tostring(c.missionId)) or c.goodsDelivered or 0
-end
-
 local function checkXsotanCount()
     local c = missionData.custom
     runSectorCode(c.endpointA.x, c.endpointA.y, true, countXsotanCode, "run", Player().index, c.missionId)
@@ -527,15 +495,14 @@ function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex
         resourceAmount = resourceAmount,
         goodsName = goodsName,
         goodsAmount = goodsAmount,
-        goodsDelivered = 0,
         phase = 1,
-        deliveryPoll = 0,
         xsotanPoll = 0,
         invasionStarted = false,
         completionDelay = 8,
+        activationRequested = false,
     }
 
-    missionData.custom.arrivalCountdown = math.max(90, math.floor(60 + routeDistance * 22))
+    missionData.custom.arrivalCountdown = math.max(60, math.floor(50 + routeDistance * 18))
 
     missionData.brief = "Construct Gate"%_T
     missionData.title = "Gate Construction (${ax}:${ay}) <-> (${bx}:${by})"%_T % {ax = ax, ay = ay, bx = bx, by = by}
@@ -543,8 +510,8 @@ function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex
 
     updateObjectivesFromPhase()
 
-    Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Normal,
-        "Contract accepted. We have dispatched a cargo ship to sector (${x}:${y})."%_T, ax, ay)
+    Player():sendChatMessage("Research Station"%_T, ChatMessageType.Normal,
+        "Contract accepted. The research station will construct an inactive gate in sector (${x}:${y}) once the site is secure."%_T, ax, ay)
 
     sync()
 end
@@ -570,21 +537,19 @@ function update(timeStep)
         end
 
         if c.waitingForClearSector then
-            Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Information,
-                "Construction zone is now clear. Cargo vessel is making final approach to (${x}:${y})."%_T,
+            Player():sendChatMessage("Research Station"%_T, ChatMessageType.Information,
+                "Construction zone is now clear. The station is preparing the inactive gate in (${x}:${y})."%_T,
                 c.endpointA.x, c.endpointA.y)
             c.waitingForClearSector = false
         end
 
         if c.arrivalCountdown <= 0 then
-            spawnCargoAtDestination()
             spawnInactiveAnchors()
 
             c.phase = 2
-            c.deliveryPoll = 0
 
-            Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Normal,
-                "Cargo ship arrived in (${x}:${y}). Deliver the required components to begin activation."%_T,
+            Player():sendChatMessage("Research Station"%_T, ChatMessageType.Normal,
+                "The inactive gate has appeared in (${x}:${y}). Interact with it to begin activation."%_T,
                 c.endpointA.x, c.endpointA.y)
 
             updateObjectivesFromPhase()
@@ -592,25 +557,16 @@ function update(timeStep)
         end
 
     elseif c.phase == 2 then
-        c.deliveryPoll = c.deliveryPoll + timeStep
-        if c.deliveryPoll >= 4 then
-            c.deliveryPoll = 0
-            checkDeliveryProgress()
+        if c.activationRequested then
+            c.phase = 3
+            c.xsotanPoll = 0
+            spawnInvasion()
 
-            if c.goodsDelivered >= c.goodsAmount then
-                c.phase = 3
-                c.xsotanPoll = 0
-                spawnInvasion()
+            Player():sendChatMessage("Research Station"%_T, ChatMessageType.Warning,
+                "Activation sequence started. Defend the construction sector until all Xsotan are destroyed!"%_T)
 
-                Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Warning,
-                    "Activation sequence started. Defend the construction sector until all Xsotan are destroyed!"%_T)
-
-                updateObjectivesFromPhase()
-                sync()
-            else
-                updateObjectivesFromPhase()
-                sync()
-            end
+            updateObjectivesFromPhase()
+            sync()
         end
 
     elseif c.phase == 3 then
@@ -634,8 +590,8 @@ function update(timeStep)
                 updateObjectivesFromPhase()
                 sync()
 
-                Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Normal,
-                    "The new gate route is online. Construction cargo ship is leaving the sector."%_T)
+                Player():sendChatMessage("Research Station"%_T, ChatMessageType.Normal,
+                    "The new gate route is online. The construction team is withdrawing from the sector."%_T)
 
                 showMissionAccomplished()
             end
@@ -675,11 +631,9 @@ function getMissionDescription()
     }
 
     if c.phase == 1 then
-        return base .. "\n\nCurrent Objective: Wait for the cargo ship to reach the destination sector."%_T
+        return base .. "\n\nCurrent Objective: Wait for the inactive gate to be constructed in the destination sector."%_T
     elseif c.phase == 2 then
-        return base .. "\n\nCurrent Objective: Deliver ${amount} ${good} to the construction cargo ship in (${x}:${y})."%_T % {
-            amount = c.goodsAmount,
-            good = c.goodsName,
+        return base .. "\n\nCurrent Objective: Interact with the inactive gate in (${x}:${y}) to begin activation."%_T % {
             x = c.endpointA.x,
             y = c.endpointA.y,
         }

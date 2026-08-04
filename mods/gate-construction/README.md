@@ -4,11 +4,12 @@ Gate commissioning mission mod for Avorion.
 
 ## What it adds
 
-- New interaction at Travel Hubs: commission a gate connection between two sectors.
+- New interaction at Research Stations: commission a gate connection between two sectors.
+- Gate construction progression is unlocked through Adventurer mail tied to the Wormhole Guardian storyline.
 - Distance-scaled downpayment in credits and one material tier.
 - Mission flow:
-  - Wait for faction cargo ship arrival.
-  - Deliver construction goods to the cargo ship.
+  - Wait for the research station to finish construction.
+  - Interact with the inactive gate to start activation.
   - Defend against a strong Xsotan invasion wave.
   - Activate the gate link when the battle is won.
 - Abandon behavior:
@@ -23,6 +24,6 @@ Gate commissioning mission mod for Avorion.
 
 ## Current implementation scope
 
-This first version implements the full mission backbone and persistence.
-The "inactive gate" state is represented by clearly marked gate-construction
-beacons until final activation, where active gate entities are spawned.
+This version implements the full mission backbone and persistence.
+Real inactive gates are spawned and later activated into fully functional links
+after the defense objective is completed.

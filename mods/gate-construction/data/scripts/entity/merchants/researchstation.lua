@@ -1,10 +1,10 @@
--- Gate Construction mod extension for Travel Hub.
--- This name-clashes with vanilla travelhub.lua and is injected before return.
+-- Gate Construction mod extension for Research Station.
+-- This name-clashes with vanilla researchstation.lua and is injected before return.
 
 if onServer() then
-    local originalInitialize = TravelHub.initialize
+    local originalInitialize = ResearchStation.initialize
 
-    function TravelHub.initialize(...)
+    function ResearchStation.initialize(...)
         if type(originalInitialize) == "function" then
             originalInitialize(...)
         end

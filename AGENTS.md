@@ -14,6 +14,8 @@ $HOME/Library/Application Support/Steam/steamapps/common/Avorion
 Do not create, edit, move, rename, or delete files there.
 
 - Allowed: read-only access for API or architecture reference.
+- Allowed: read-only access to Avorion installation scripts for API,
+  architecture, and behavior reference.
 - Forbidden: any write operation in the Steam installation.
 
 If a task appears to require changing vanilla game files, stop and implement the

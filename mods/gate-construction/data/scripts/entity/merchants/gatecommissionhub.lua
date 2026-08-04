@@ -12,7 +12,7 @@ local GatesMap = include("gatesmap")
 -- Don't remove or alter the following comment, it tells the game the namespace this script lives in.
 -- namespace GateCommissionHub
 GateCommissionHub = {}
-GateCommissionHub.interactionThreshold = 10000
+GateCommissionHub.interactionThreshold = -30000
 
 local ui = {}
 
@@ -133,6 +133,19 @@ local function hasActiveMissionScript(player)
     return false
 end
 
+local function hasGateConstructionTheory(faction)
+    if not faction then return false end
+    return faction:getValue("gate_construction_gate_theory_mail_sent") == true
+end
+
+local function isCoreResearchStation(station, buyer)
+    if not station or not buyer then return false end
+    if station.factionIndex ~= buyer.index then return false end
+
+    local x, y = station:getCoordinates()
+    return Galaxy():isCentralFactionArea(x, y)
+end
+
 function GateCommissionHub.interactionPossible(playerIndex, option)
     return CheckFactionInteraction(playerIndex, GateCommissionHub.interactionThreshold)
 end
@@ -145,7 +158,7 @@ function GateCommissionHub.initUI()
     local window = menu:createWindow(Rect(res * 0.5 - size * 0.5, res * 0.5 + size * 0.5))
     menu:registerWindow(window, "Gate Commission"%_T, 10)
 
-    window.caption = "Gate Construction Office"%_T
+    window.caption = "Gate Construction Research"%_T
     window.showCloseButton = 1
     window.moveable = 1
 
@@ -185,8 +198,8 @@ function GateCommissionHub.initUI()
     ui.distanceLabel = window:createLabel(quoteLister:nextRect(18), "Route Distance: -"%_T, 12)
     ui.creditsLabel = window:createLabel(quoteLister:nextRect(18), "Credits Fee: -"%_T, 12)
     ui.resourcesLabel = window:createLabel(quoteLister:nextRect(18), "Material Downpayment: -"%_T, 12)
-    ui.goodsLabel = window:createLabel(quoteLister:nextRect(18), "Post-Arrival Delivery: -"%_T, 12)
-    ui.ruleLabel = window:createLabel(quoteLister:nextRect(18), "Rules: sectors must be known and diplomatic constraints must be met."%_T, 12)
+    ui.goodsLabel = window:createLabel(quoteLister:nextRect(18), "Research Station Cargo Bay: -"%_T, 12)
+    ui.ruleLabel = window:createLabel(quoteLister:nextRect(18), "Rules: the station must be your own research station in the galactic core, and both endpoint sectors must be known."%_T, 12)
     ui.warningLabel = window:createLabel(quoteLister:nextRect(54), "Warning: canceling the mission refunds material downpayment only. Credits are never refunded."%_T, 12)
     ui.warningLabel.color = ColorRGB(0.95, 0.7, 0.35)
 
@@ -264,7 +277,7 @@ end
 function GateCommissionHub.receiveQuote(ok, quote, err)
     if not ok then
         if err and err ~= "" then
-            displayChatMessage(err, "Travel Hub"%_T, ChatMessageType.Error)
+            displayChatMessage(err, "Research Station"%_T, ChatMessageType.Error)
         end
         return
     end
@@ -272,7 +285,7 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
     ui.distanceLabel.caption = "Route Distance: ${d}"%_T % {d = string.format("%.1f", quote.jumpDistance or 0)}
     ui.creditsLabel.caption = "Credits Fee: ¢${c}"%_T % {c = createMonetaryString(quote.credits or 0)}
     ui.resourcesLabel.caption = "Material Downpayment: ${amount} ${name}"%_T % {amount = quote.resourceAmount or 0, name = quote.resourceName or "Iron"}
-    ui.goodsLabel.caption = "Post-Arrival Delivery: ${amount} ${name}"%_T % {amount = quote.goodsAmount or 0, name = quote.goodsName or "Energy Cell"}
+    ui.goodsLabel.caption = "Research Station Cargo Bay: ${amount} ${name}"%_T % {amount = quote.goodsAmount or 0, name = quote.goodsName or "Energy Cell"}
 end
 
 function GateCommissionHub.onStartProject()
@@ -293,7 +306,7 @@ function GateCommissionHub.commissionResult(ok, message)
     if ok then
         ScriptUI():showDialog(d)
     else
-        d.talker = "Travel Hub"%_T
+        d.talker = "Research Station"%_T
         ScriptUI():showDialog(d)
     end
 end
@@ -320,7 +333,6 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
     end
 
     local station = Entity()
-    local builderFaction = Faction(station.factionIndex)
 
     local ok, err = validateEndpoints(ax, ay, bx, by)
     if not ok then
@@ -334,13 +346,27 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
+    local builderFaction = Faction(station.factionIndex)
+
+    if not isCoreResearchStation(station, buyer) then
+        invokeClientFunction(player, "commissionResult", false,
+            "This gate project can only be commissioned from your own Research Station in the galactic core."%_T)
+        return
+    end
+
+    if not hasGateConstructionTheory(buyer) then
+        invokeClientFunction(player, "commissionResult", false,
+            "Our researchers cannot proceed yet. We suspect the wormhole in the center of the galaxy is tied to gate construction, but we need firmer proof before the station can begin a project of this scale.\n\nDestroy the Wormhole Guardian, then read the Adventurer's follow-up mail. Once the core research station has confirmed the theory, we can accept your commission."%_T)
+        return
+    end
+
     if hasActiveMissionScript(player) then
         invokeClientFunction(player, "commissionResult", false, "You already have an active gate construction mission."%_T)
         return
     end
 
     if isAtWarWithBuilder(ax, ay, builderFaction) or isAtWarWithBuilder(bx, by, builderFaction) then
-        invokeClientFunction(player, "commissionResult", false, "A controlling faction on one endpoint is at war with this travel hub's faction."%_T)
+        invokeClientFunction(player, "commissionResult", false, "A controlling faction on one endpoint is at war with this research station's faction."%_T)
         return
     end
 
@@ -379,6 +405,6 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
     end
 
     invokeClientFunction(player, "commissionResult", true,
-        "Contract signed. The hub has dispatched a cargo ship. Track your mission objectives for next steps."%_T)
+        "Contract signed. The research station will begin building the inactive gate in the destination sector. Track your mission objectives for next steps."%_T)
 end
 callable(GateCommissionHub, "startCommission")
