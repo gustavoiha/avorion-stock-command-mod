@@ -6,6 +6,7 @@ include("stringutility")
 include("relations")
 include("faction")
 include("galaxy")
+include("goods")
 local Dialog = include("dialogutility")
 local GatesMap = include("gatesmap")
 
@@ -19,8 +20,20 @@ local ui = {}
 local FIXED_CREDITS_FEE = 5000000
 local FIXED_OGONITE_AMOUNT = 500000
 local FIXED_AVORION_AMOUNT = 500000
-local FIXED_GOODS_NAME = "Energy Cell"
-local FIXED_GOODS_AMOUNT = 1200
+
+local FIXED_GOODS_REQUIREMENTS = {
+    {name = "Antigrav Generator", amount = 8},
+    {name = "Drill", amount = 8},
+    {name = "Electron Accelerator", amount = 7},
+    {name = "Force Generator", amount = 8},
+    {name = "Fusion Generator", amount = 7},
+    {name = "High Capacity Lens", amount = 7},
+    {name = "Neutron Accelerator", amount = 7},
+    {name = "Proton Accelerator", amount = 7},
+    {name = "Satellite", amount = 8},
+    {name = "Teleporter", amount = 7},
+    {name = "Turbine", amount = 7},
+}
 
 local function makeResourceVector()
     local result = {0, 0, 0, 0, 0, 0, 0}
@@ -35,16 +48,79 @@ local function distance2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
+local function computeGoodsRequirements()
+    local requirements = {}
+    local totalValue = 0
+
+    for _, req in pairs(FIXED_GOODS_REQUIREMENTS) do
+        local def = goods[req.name]
+        local unitPrice = def and def.price or 0
+        local entry = {
+            name = req.name,
+            amount = req.amount,
+            unitPrice = unitPrice,
+            totalPrice = unitPrice * req.amount,
+        }
+
+        totalValue = totalValue + entry.totalPrice
+        table.insert(requirements, entry)
+    end
+
+    return requirements, totalValue
+end
+
+local function hasRequiredStationGoods(station, requirements)
+    for _, req in pairs(requirements) do
+        local def = goods[req.name]
+        if not def then
+            return false, "Missing goods definition for ${good}."%_T % {good = req.name}
+        end
+
+        local good = def:good()
+        local onStation = station:getCargoAmount(good)
+        if onStation < req.amount then
+            return false, "Research Station cargo missing ${need} ${good} (has ${have})."%_T % {
+                need = req.amount,
+                good = good:displayName(req.amount),
+                have = onStation,
+            }
+        end
+    end
+
+    return true
+end
+
+local function removeRequiredStationGoods(station, requirements)
+    for _, req in pairs(requirements) do
+        local def = goods[req.name]
+        if def then
+            station:removeCargo(def:good(), req.amount)
+        end
+    end
+end
+
+local function restoreRequiredStationGoods(station, requirements)
+    for _, req in pairs(requirements) do
+        local def = goods[req.name]
+        if def then
+            station:addCargo(def:good(), req.amount)
+        end
+    end
+end
+
 local function computeQuote(ax, ay, bx, by)
     local jumpDistance = distance2d(ax, ay, bx, by)
+    local goodsRequirements, goodsTotalValue = computeGoodsRequirements()
 
     return {
         jumpDistance = jumpDistance,
         credits = FIXED_CREDITS_FEE,
         ogoniteAmount = FIXED_OGONITE_AMOUNT,
         avorionAmount = FIXED_AVORION_AMOUNT,
-        goodsName = FIXED_GOODS_NAME,
-        goodsAmount = FIXED_GOODS_AMOUNT,
+        goodsRequirements = goodsRequirements,
+        goodsTotalValue = goodsTotalValue,
+        goodsName = "Research Bundle",
+        goodsAmount = goodsTotalValue,
     }
 end
 
@@ -263,7 +339,10 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
         ogonite = quote.ogoniteAmount or 0,
         avorion = quote.avorionAmount or 0,
     }
-    ui.goodsLabel.caption = "Research Station Cargo Bay: ${amount} ${name}"%_T % {amount = quote.goodsAmount or 0, name = quote.goodsName or "Energy Cell"}
+    ui.goodsLabel.caption = "Research Station Cargo Bay: ${types} required goods (~¢${value})"%_T % {
+        types = quote.goodsRequirements and #quote.goodsRequirements or 0,
+        value = createMonetaryString(quote.goodsTotalValue or 0),
+    }
 end
 
 function GateCommissionHub.onStartProject()
@@ -362,6 +441,14 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
+    local goodsOk, goodsErr = hasRequiredStationGoods(station, quote.goodsRequirements or {})
+    if not goodsOk then
+        invokeClientFunction(player, "commissionResult", false, goodsErr)
+        return
+    end
+
+    removeRequiredStationGoods(station, quote.goodsRequirements or {})
+
     buyer:pay("Paid gate construction downpayment."%_T, quote.credits, unpack(resources))
 
     local scriptIndex = player:addScript("data/scripts/player/missions/gateconstruction.lua",
@@ -377,6 +464,7 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         quote.goodsAmount)
 
     if not scriptIndex then
+        restoreRequiredStationGoods(station, quote.goodsRequirements or {})
         buyer:receive("Refunded gate construction downpayment."%_T, quote.credits, unpack(resources))
         invokeClientFunction(player, "commissionResult", false, "Could not start the gate construction mission."%_T)
         return
