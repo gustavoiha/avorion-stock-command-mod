@@ -17,16 +17,22 @@ local function distance2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
-local function makeResourceVector(ogoniteAmount, avorionAmount, legacyIndex, legacyAmount)
+local function makeResourceVector(ironAmount, triniumAmount, xanionAmount, avorionAmount, legacyIndex, legacyAmount)
     local result = {0, 0, 0, 0, 0, 0, 0}
-    if ogoniteAmount and ogoniteAmount > 0 then
-        result[6] = ogoniteAmount
+    if ironAmount and ironAmount > 0 then
+        result[1] = ironAmount
+    end
+    if triniumAmount and triniumAmount > 0 then
+        result[4] = triniumAmount
+    end
+    if xanionAmount and xanionAmount > 0 then
+        result[5] = xanionAmount
     end
     if avorionAmount and avorionAmount > 0 then
         result[7] = avorionAmount
     end
 
-    if result[6] == 0 and result[7] == 0 and legacyIndex and legacyAmount and legacyIndex >= 1 and legacyIndex <= 7 then
+    if result[1] == 0 and result[4] == 0 and result[5] == 0 and result[7] == 0 and legacyIndex and legacyAmount and legacyIndex >= 1 and legacyIndex <= 7 then
         result[legacyIndex] = legacyAmount
     end
     return result
@@ -346,7 +352,7 @@ local function refundMaterialsOnly()
     local payer = Faction(c.commissioningFactionIndex)
     if not payer then return end
 
-    local resources = makeResourceVector(c.ogoniteAmount, c.avorionAmount, c.resourceIndex, c.resourceAmount)
+    local resources = makeResourceVector(c.ironAmount, c.triniumAmount, c.xanionAmount, c.avorionAmount, c.resourceIndex, c.resourceAmount)
     payer:receive("Refunded gate-construction material downpayment after mission cancelation."%_T, 0, unpack(resources))
     c.materialRefunded = true
 end
@@ -468,7 +474,7 @@ local function checkXsotanCount()
     return Player():getValue("gate_construction_xsotan_" .. tostring(c.missionId)) or 0
 end
 
-function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, ogoniteAmount, avorionAmount, goodsName, goodsAmount)
+function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, ironAmount, triniumAmount, xanionAmount, avorionAmount, goodsName, goodsAmount)
     initMissionCallbacks()
 
     if onClient() then
@@ -493,7 +499,9 @@ function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex
         dispatchSector = {x = sx, y = sy},
         routeDistance = routeDistance,
         creditsPaid = creditsPaid,
-        ogoniteAmount = ogoniteAmount,
+        ironAmount = ironAmount,
+        triniumAmount = triniumAmount,
+        xanionAmount = xanionAmount,
         avorionAmount = avorionAmount,
         goodsName = goodsName,
         goodsAmount = goodsAmount,
@@ -623,12 +631,14 @@ function getMissionDescription()
 
     local c = missionData.custom
 
-    local matText = "${ogonite} Ogonite + ${avorion} Avorion"%_T % {
-        ogonite = c.ogoniteAmount or 0,
+    local matText = "${iron} Iron + ${trinium} Trinium + ${xanion} Xanion + ${avorion} Avorion"%_T % {
+        iron = c.ironAmount or 0,
+        trinium = c.triniumAmount or 0,
+        xanion = c.xanionAmount or 0,
         avorion = c.avorionAmount or 0,
     }
 
-    if (not c.ogoniteAmount or not c.avorionAmount) and c.resourceAmount and c.resourceIndex then
+    if (not c.ironAmount or not c.triniumAmount or not c.xanionAmount or not c.avorionAmount) and c.resourceAmount and c.resourceIndex then
         matText = "${amount} unit(s) of tier ${tier}"%_T % {
             amount = c.resourceAmount,
             tier = c.resourceIndex,

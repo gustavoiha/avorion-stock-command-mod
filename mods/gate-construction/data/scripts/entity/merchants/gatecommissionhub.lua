@@ -18,8 +18,10 @@ GateCommissionHub.interactionThreshold = -30000
 local ui = {}
 
 local FIXED_CREDITS_FEE = 5000000
-local FIXED_OGONITE_AMOUNT = 500000
-local FIXED_AVORION_AMOUNT = 500000
+local FIXED_IRON_AMOUNT = 50000
+local FIXED_TRINIUM_AMOUNT = 20000
+local FIXED_XANION_AMOUNT = 20000
+local FIXED_AVORION_AMOUNT = 10000
 
 local FIXED_GOODS_REQUIREMENTS = {
     {name = "Antigrav Generator", amount = 8},
@@ -37,7 +39,9 @@ local FIXED_GOODS_REQUIREMENTS = {
 
 local function makeResourceVector()
     local result = {0, 0, 0, 0, 0, 0, 0}
-    result[6] = FIXED_OGONITE_AMOUNT
+    result[1] = FIXED_IRON_AMOUNT
+    result[4] = FIXED_TRINIUM_AMOUNT
+    result[5] = FIXED_XANION_AMOUNT
     result[7] = FIXED_AVORION_AMOUNT
     return result
 end
@@ -115,7 +119,9 @@ local function computeQuote(ax, ay, bx, by)
     return {
         jumpDistance = jumpDistance,
         credits = FIXED_CREDITS_FEE,
-        ogoniteAmount = FIXED_OGONITE_AMOUNT,
+        ironAmount = FIXED_IRON_AMOUNT,
+        triniumAmount = FIXED_TRINIUM_AMOUNT,
+        xanionAmount = FIXED_XANION_AMOUNT,
         avorionAmount = FIXED_AVORION_AMOUNT,
         goodsRequirements = goodsRequirements,
         goodsTotalValue = goodsTotalValue,
@@ -335,8 +341,10 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
 
     ui.distanceLabel.caption = "Route Distance: ${d}"%_T % {d = string.format("%.1f", quote.jumpDistance or 0)}
     ui.creditsLabel.caption = "Credits Fee: ¢${c}"%_T % {c = createMonetaryString(quote.credits or 0)}
-    ui.resourcesLabel.caption = "Material Downpayment: ${ogonite} Ogonite + ${avorion} Avorion"%_T % {
-        ogonite = quote.ogoniteAmount or 0,
+    ui.resourcesLabel.caption = "Material Downpayment: ${iron} Iron + ${trinium} Trinium + ${xanion} Xanion + ${avorion} Avorion"%_T % {
+        iron = quote.ironAmount or 0,
+        trinium = quote.triniumAmount or 0,
+        xanion = quote.xanionAmount or 0,
         avorion = quote.avorionAmount or 0,
     }
     ui.goodsLabel.caption = "Research Station Cargo Bay: ${types} required goods (~¢${value})"%_T % {
@@ -458,7 +466,9 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         ax, ay,
         bx, by,
         quote.credits,
-        quote.ogoniteAmount,
+        quote.ironAmount,
+        quote.triniumAmount,
+        quote.xanionAmount,
         quote.avorionAmount,
         quote.goodsName,
         quote.goodsAmount)
