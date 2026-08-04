@@ -55,21 +55,105 @@ function run(playerIndex, key, factionIndex, goodsName, goodsAmount)
 end
 ]]
 
-local spawnInactiveMarkerCode = [[
+local spawnInactiveGateCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 package.path = package.path .. ";data/scripts/?.lua"
 
-local SectorGenerator = include("SectorGenerator")
+include("galaxy")
 
 function run(key, factionIndex, tx, ty)
     local x, y = Sector():getCoordinates()
 
-    local faction = Faction(factionIndex)
-    local generator = SectorGenerator(x, y)
-    local anchor = generator:createBeacon(nil, faction, "Inactive gate anchor to (${x}:${y})"%_T, {x = tx, y = ty})
-    anchor.title = "Inactive Gate Anchor"%_T
-    anchor:setValue(key, true)
-    anchor:setValue("gate_construction_inactive_anchor", true)
+    local faction = Faction(factionIndex) or Galaxy():getNearestFaction(x, y)
+    if not faction then return end
+
+    local desc = EntityDescriptor()
+    desc:addComponents(
+       ComponentType.Plan,
+       ComponentType.BspTree,
+       ComponentType.Intersection,
+       ComponentType.Asleep,
+       ComponentType.DamageContributors,
+       ComponentType.BoundingSphere,
+       ComponentType.PlanMaxDurability,
+       ComponentType.Durability,
+       ComponentType.BoundingBox,
+       ComponentType.Velocity,
+       ComponentType.Physics,
+       ComponentType.Scripts,
+       ComponentType.ScriptCallback,
+       ComponentType.Title,
+       ComponentType.Owner,
+       ComponentType.FactionNotifier,
+       ComponentType.WormHole,
+       ComponentType.EnergySystem,
+       ComponentType.EntityTransferrer,
+       ComponentType.InteractionText
+    )
+
+    local styleGenerator = StyleGenerator(faction.index)
+    local c1 = styleGenerator.factionDetails.baseColor
+    local c2 = ColorRGB(0.25, 0.25, 0.25)
+    local c3 = styleGenerator.factionDetails.paintColor
+    c1 = ColorRGB(c1.r, c1.g, c1.b)
+    c3 = ColorRGB(c3.r, c3.g, c3.b)
+
+    local plan = PlanGenerator.makeGatePlan(Seed(faction.index) + Server().seed, c1, c2, c3)
+    local dir = vec3(tx - x, 0, ty - y)
+    if dir.x == 0 and dir.z == 0 then
+        dir = vec3(1, 0, 0)
+    else
+        normalize_ip(dir)
+    end
+
+    local position = MatrixLookUp(dir, vec3(0, 1, 0))
+    position.pos = dir * 3000
+
+    desc:setMovePlan(plan)
+    desc.position = position
+    desc.factionIndex = faction.index
+    desc.invincible = true
+    desc:addScript("data/scripts/entity/gate.lua")
+    desc:setValue("ai_no_attack", true)
+
+    local wormhole = desc:getComponent(ComponentType.WormHole)
+    wormhole:setTargetCoordinates(tx, ty)
+    wormhole.enabled = false
+    wormhole.visible = false
+    wormhole.visualSize = 50
+    wormhole.passageSize = 50
+    wormhole.oneWay = true
+
+    desc.title = "Inactive Gate"%_T
+
+    local gate = Sector():createEntity(desc)
+    if valid(gate) then
+        gate:setValue(key, true)
+        gate:setValue("gate_construction_inactive_gate", true)
+    end
+end
+]]
+
+local gateActivationVfxCode = [[
+function run(key)
+    local entities = {Sector():getEntitiesByScriptValue(key)}
+    for _, entity in pairs(entities) do
+        if valid(entity) and entity:getValue("gate_construction_inactive_gate") then
+            local p = entity.translationf
+
+            for i = 1, 14 do
+                local from = p + random():getDirection() * random():getFloat(120, 340)
+                local to = p + random():getDirection() * random():getFloat(15, 80)
+                local laser = Sector():createLaser(from, to, ColorRGB(0.2, 0.9, 0.95), random():getFloat(1.3, 2.2))
+                laser.maxAliveTime = 2.0
+                laser.animationSpeed = -2.8
+                laser.collision = false
+            end
+
+            Sector():createExplosion(p, 85, false)
+            Sector():createHyperspaceJumpAnimation(p, ColorRGB(0.2, 0.95, 0.95), 1.0)
+        end
+    end
 end
 ]]
 
@@ -242,7 +326,8 @@ local function updateObjectivesFromPhase()
 
     if custom.phase == 1 then
         local mins = math.max(1, math.floor((custom.arrivalCountdown or 0) / 60))
-        missionData.description[2] = {text = "Wait for the cargo ship to reach sector (${x}:${y}) (${m} min est.)"%_T, arguments = {x = a.x, y = a.y, m = mins}, bulletPoint = true}
+        missionData.description[2] = {text = "Secure sector (${x}:${y}) if hostiles are present. Cargo ship will only enter a clear zone."%_T, arguments = {x = a.x, y = a.y}, bulletPoint = true}
+        missionData.description[3] = {text = "Once secure: wait for cargo ship arrival (${m} min est.)"%_T, arguments = {m = mins}, bulletPoint = true}
     elseif custom.phase == 2 then
         missionData.description[2] = {text = "Deliver ${amount} ${good} to the construction cargo ship in (${x}:${y})"%_T, arguments = {amount = custom.goodsAmount, good = custom.goodsName, x = a.x, y = a.y}, bulletPoint = true}
         missionData.description[3] = {text = "Progress: ${delivered}/${amount}"%_T, arguments = {delivered = custom.goodsDelivered or 0, amount = custom.goodsAmount}, bulletPoint = true}
@@ -281,8 +366,8 @@ local function spawnInactiveAnchors()
     local c = missionData.custom
     local key = missionKey(c.missionId)
 
-    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInactiveMarkerCode, "run", key, c.builderFactionIndex, c.endpointB.x, c.endpointB.y)
-    runSectorCode(c.endpointB.x, c.endpointB.y, true, spawnInactiveMarkerCode, "run", key, c.builderFactionIndex, c.endpointA.x, c.endpointA.y)
+    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointB.x, c.endpointB.y)
+    runSectorCode(c.endpointB.x, c.endpointB.y, true, spawnInactiveGateCode, "run", key, c.builderFactionIndex, c.endpointA.x, c.endpointA.y)
 end
 
 local function spawnCargoAtDestination()
@@ -323,6 +408,56 @@ local function canOwnGateAt(x, y)
     return true
 end
 
+local function isSectorClearOfHostiles(x, y)
+    local clearCode = [[
+    function run(playerIndex, missionId)
+        local owner = Player(playerIndex)
+        local clear = true
+
+        for _, ship in pairs({Sector():getEntitiesByType(EntityType.Ship)}) do
+            if valid(ship)
+                    and not ship.playerOrAllianceOwned
+                    and not ship:getValue("gate_construction_cargo_ship")
+                    and (ship:getValue("is_xsotan") ~= nil
+                        or ship:getValue("is_pirate") ~= nil
+                        or ship:getValue("background_attacker") ~= nil) then
+                clear = false
+                break
+            end
+
+            if valid(ship)
+                    and not ship.playerOrAllianceOwned
+                    and ship.factionIndex ~= 0
+                    and owner
+                    and owner:getRelationStatus(ship.factionIndex) == RelationStatus.War then
+                clear = false
+                break
+            end
+        end
+
+        if clear then
+            for _, station in pairs({Sector():getEntitiesByType(EntityType.Station)}) do
+                if valid(station)
+                        and station.factionIndex ~= 0
+                        and owner
+                        and owner:getRelationStatus(station.factionIndex) == RelationStatus.War then
+                    clear = false
+                    break
+                end
+            end
+        end
+
+        if owner then
+            owner:setValue("gate_construction_sector_clear_" .. tostring(missionId), clear)
+        end
+    end
+    ]]
+
+    local c = missionData.custom
+    runSectorCode(x, y, true, clearCode, "run", Player().index, c.missionId)
+    return Player():getValue("gate_construction_sector_clear_" .. tostring(c.missionId)) == true
+end
+
 local function clearInactiveAndSpawnActiveGates()
     local c = missionData.custom
     local key = missionKey(c.missionId)
@@ -341,6 +476,9 @@ local function clearInactiveAndSpawnActiveGates()
 
     local ownerAIndex = ownerA and ownerA.index or c.commissioningFactionIndex
     local ownerBIndex = ownerB and ownerB.index or c.commissioningFactionIndex
+
+    runSectorCode(c.endpointA.x, c.endpointA.y, true, gateActivationVfxCode, "run", key)
+    runSectorCode(c.endpointB.x, c.endpointB.y, true, gateActivationVfxCode, "run", key)
 
     runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnActiveGateCode, "run", key, ownerAIndex, c.endpointB.x, c.endpointB.y)
     runSectorCode(c.endpointB.x, c.endpointB.y, true, spawnActiveGateCode, "run", key, ownerBIndex, c.endpointA.x, c.endpointA.y)
@@ -422,6 +560,21 @@ function update(timeStep)
 
     if c.phase == 1 then
         c.arrivalCountdown = c.arrivalCountdown - timeStep
+
+        local clear = isSectorClearOfHostiles(c.endpointA.x, c.endpointA.y)
+        if not clear then
+            c.arrivalCountdown = math.max(c.arrivalCountdown, 35)
+            c.waitingForClearSector = true
+            sync()
+            return
+        end
+
+        if c.waitingForClearSector then
+            Player():sendChatMessage("Travel Hub"%_T, ChatMessageType.Information,
+                "Construction zone is now clear. Cargo vessel is making final approach to (${x}:${y})."%_T,
+                c.endpointA.x, c.endpointA.y)
+            c.waitingForClearSector = false
+        end
 
         if c.arrivalCountdown <= 0 then
             spawnCargoAtDestination()
