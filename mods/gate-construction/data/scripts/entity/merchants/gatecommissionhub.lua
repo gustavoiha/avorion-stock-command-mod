@@ -16,21 +16,16 @@ GateCommissionHub.interactionThreshold = -30000
 
 local ui = {}
 
-local ResourceNames = {
-    [1] = "Iron",
-    [2] = "Titanium",
-    [3] = "Naonite",
-    [4] = "Trinium",
-    [5] = "Xanion",
-    [6] = "Ogonite",
-    [7] = "Avorion",
-}
+local FIXED_CREDITS_FEE = 5000000
+local FIXED_OGONITE_AMOUNT = 500000
+local FIXED_AVORION_AMOUNT = 500000
+local FIXED_GOODS_NAME = "Energy Cell"
+local FIXED_GOODS_AMOUNT = 1200
 
-local function makeResourceVector(resourceIndex, amount)
+local function makeResourceVector()
     local result = {0, 0, 0, 0, 0, 0, 0}
-    if resourceIndex and amount and resourceIndex >= 1 and resourceIndex <= 7 then
-        result[resourceIndex] = amount
-    end
+    result[6] = FIXED_OGONITE_AMOUNT
+    result[7] = FIXED_AVORION_AMOUNT
     return result
 end
 
@@ -40,36 +35,16 @@ local function distance2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
-local function pickMaterialTier(centerDistance)
-    if centerDistance <= 90 then return 1 end
-    if centerDistance <= 180 then return 2 end
-    if centerDistance <= 260 then return 3 end
-    if centerDistance <= 340 then return 4 end
-    if centerDistance <= 410 then return 5 end
-    if centerDistance <= 470 then return 6 end
-    return 7
-end
-
 local function computeQuote(ax, ay, bx, by)
     local jumpDistance = distance2d(ax, ay, bx, by)
-    local centerA = distance2d(ax, ay, 0, 0)
-    local centerB = distance2d(bx, by, 0, 0)
-    local centerDistance = math.max(centerA, centerB)
-
-    local resourceIndex = pickMaterialTier(centerDistance)
-    local credits = math.floor(400000 + jumpDistance * 160000 + centerDistance * 3500)
-    local resourceAmount = math.floor(2000 + jumpDistance * 260 + resourceIndex * 700)
-    local goodsAmount = math.floor(300 + jumpDistance * 90)
 
     return {
         jumpDistance = jumpDistance,
-        centerDistance = centerDistance,
-        credits = credits,
-        resourceIndex = resourceIndex,
-        resourceName = ResourceNames[resourceIndex] or "Iron",
-        resourceAmount = resourceAmount,
-        goodsName = "Energy Cell",
-        goodsAmount = goodsAmount,
+        credits = FIXED_CREDITS_FEE,
+        ogoniteAmount = FIXED_OGONITE_AMOUNT,
+        avorionAmount = FIXED_AVORION_AMOUNT,
+        goodsName = FIXED_GOODS_NAME,
+        goodsAmount = FIXED_GOODS_AMOUNT,
     }
 end
 
@@ -284,7 +259,10 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
 
     ui.distanceLabel.caption = "Route Distance: ${d}"%_T % {d = string.format("%.1f", quote.jumpDistance or 0)}
     ui.creditsLabel.caption = "Credits Fee: ¢${c}"%_T % {c = createMonetaryString(quote.credits or 0)}
-    ui.resourcesLabel.caption = "Material Downpayment: ${amount} ${name}"%_T % {amount = quote.resourceAmount or 0, name = quote.resourceName or "Iron"}
+    ui.resourcesLabel.caption = "Material Downpayment: ${ogonite} Ogonite + ${avorion} Avorion"%_T % {
+        ogonite = quote.ogoniteAmount or 0,
+        avorion = quote.avorionAmount or 0,
+    }
     ui.goodsLabel.caption = "Research Station Cargo Bay: ${amount} ${name}"%_T % {amount = quote.goodsAmount or 0, name = quote.goodsName or "Energy Cell"}
 end
 
@@ -376,7 +354,7 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
     end
 
     local quote = computeQuote(ax, ay, bx, by)
-    local resources = makeResourceVector(quote.resourceIndex, quote.resourceAmount)
+    local resources = makeResourceVector()
 
     local canPay, msg, args = buyer:canPay(quote.credits, unpack(resources))
     if not canPay then
@@ -393,8 +371,8 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         ax, ay,
         bx, by,
         quote.credits,
-        quote.resourceIndex,
-        quote.resourceAmount,
+        quote.ogoniteAmount,
+        quote.avorionAmount,
         quote.goodsName,
         quote.goodsAmount)
 

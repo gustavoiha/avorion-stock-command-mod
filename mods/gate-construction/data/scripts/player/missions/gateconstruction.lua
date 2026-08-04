@@ -17,10 +17,17 @@ local function distance2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
-local function makeResourceVector(index, amount)
+local function makeResourceVector(ogoniteAmount, avorionAmount, legacyIndex, legacyAmount)
     local result = {0, 0, 0, 0, 0, 0, 0}
-    if index and amount and index >= 1 and index <= 7 then
-        result[index] = amount
+    if ogoniteAmount and ogoniteAmount > 0 then
+        result[6] = ogoniteAmount
+    end
+    if avorionAmount and avorionAmount > 0 then
+        result[7] = avorionAmount
+    end
+
+    if result[6] == 0 and result[7] == 0 and legacyIndex and legacyAmount and legacyIndex >= 1 and legacyIndex <= 7 then
+        result[legacyIndex] = legacyAmount
     end
     return result
 end
@@ -186,17 +193,17 @@ include("randomext")
 local AsyncXsotanGenerator = include("asyncxsotangenerator")
 local SpawnUtility = include("spawnutility")
 
-function run(scale)
+function run()
     local volumes = {
         {size = 1}, {size = 1}, {size = 2}, {size = 3}, {size = 3},
-        {size = 5}, {size = 3}, {size = 2}, {size = 1}, {size = 1}
+        {size = 5}, {size = 3}, {size = 3}, {size = 2}, {size = 1}, {size = 1}
     }
 
-    -- double the regular event strength by duplicating the standard shape.
+    -- Match the regular large invasion shape and spawn it twice.
     local wave = {}
     for i = 1, 2 do
         for _, entry in pairs(volumes) do
-            table.insert(wave, {size = entry.size * (scale or 1)})
+            table.insert(wave, {size = entry.size})
         end
     end
 
@@ -339,7 +346,7 @@ local function refundMaterialsOnly()
     local payer = Faction(c.commissioningFactionIndex)
     if not payer then return end
 
-    local resources = makeResourceVector(c.resourceIndex, c.resourceAmount)
+    local resources = makeResourceVector(c.ogoniteAmount, c.avorionAmount, c.resourceIndex, c.resourceAmount)
     payer:receive("Refunded gate-construction material downpayment after mission cancelation."%_T, 0, unpack(resources))
     c.materialRefunded = true
 end
@@ -358,12 +365,7 @@ local function spawnInvasion()
     Player():sendChatMessage(""%_T, ChatMessageType.Information, "Your sensors picked up short bursts of subspace signals near the construction zone."%_T)
     Player():sendChatMessage(""%_T, ChatMessageType.Warning, "Subspace signatures are surging. Brace for a major Xsotan assault!"%_T)
 
-    local distance = distance2d(c.endpointA.x, c.endpointA.y, 0, 0)
-    local scale = 1
-    if distance > 250 then scale = 1.2 end
-    if distance > 380 then scale = 1.35 end
-
-    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInvasionCode, "run", scale)
+    runSectorCode(c.endpointA.x, c.endpointA.y, true, spawnInvasionCode, "run")
     c.invasionStarted = true
 end
 
@@ -466,7 +468,7 @@ local function checkXsotanCount()
     return Player():getValue("gate_construction_xsotan_" .. tostring(c.missionId)) or 0
 end
 
-function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, resourceIndex, resourceAmount, goodsName, goodsAmount)
+function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, ogoniteAmount, avorionAmount, goodsName, goodsAmount)
     initMissionCallbacks()
 
     if onClient() then
@@ -491,8 +493,8 @@ function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex
         dispatchSector = {x = sx, y = sy},
         routeDistance = routeDistance,
         creditsPaid = creditsPaid,
-        resourceIndex = resourceIndex,
-        resourceAmount = resourceAmount,
+        ogoniteAmount = ogoniteAmount,
+        avorionAmount = avorionAmount,
         goodsName = goodsName,
         goodsAmount = goodsAmount,
         phase = 1,
@@ -621,13 +623,25 @@ function getMissionDescription()
 
     local c = missionData.custom
 
+    local matText = "${ogonite} Ogonite + ${avorion} Avorion"%_T % {
+        ogonite = c.ogoniteAmount or 0,
+        avorion = c.avorionAmount or 0,
+    }
+
+    if (not c.ogoniteAmount or not c.avorionAmount) and c.resourceAmount and c.resourceIndex then
+        matText = "${amount} unit(s) of tier ${tier}"%_T % {
+            amount = c.resourceAmount,
+            tier = c.resourceIndex,
+        }
+    end
+
     local base = "Two endpoints were contracted: (${ax}:${ay}) and (${bx}:${by}).\nCredits fee paid: ¢${credits}. Material downpayment: ${mat}."%_T % {
         ax = c.endpointA.x,
         ay = c.endpointA.y,
         bx = c.endpointB.x,
         by = c.endpointB.y,
         credits = createMonetaryString(c.creditsPaid or 0),
-        mat = c.resourceAmount,
+        mat = matText,
     }
 
     if c.phase == 1 then

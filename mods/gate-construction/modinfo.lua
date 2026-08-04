@@ -5,12 +5,13 @@ meta =
     title = "Gate Construction",
     type = "mod",
 
-    description = "Lets players commission faction-built gates from Travel Hubs. "
-        .. "Includes distance-scaled costs, cargo delivery objectives, and an "
-        .. "Xsotan defense sequence before gate activation.",
+    description = "Adds Research Station gate commissioning between two sectors, "
+        .. "unlocked after the Wormhole Guardian arc. "
+        .. "Uses a fixed downpayment (Ogonite + Avorion), setup time scaling by "
+        .. "endpoint distance, and a 2x local-strength Xsotan activation invasion.",
 
     authors = {"Gugs_Iha"},
-    version = "0.1",
+    version = "1.1",
 
     dependencies = {
     },
