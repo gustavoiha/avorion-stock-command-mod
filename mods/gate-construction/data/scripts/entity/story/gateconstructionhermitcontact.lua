@@ -21,6 +21,11 @@ local function hasUnlockedForFaction(faction)
     return faction:getValue("gate_construction_hermit_gate_access") == true
 end
 
+local function hasGuardianProgress(player)
+    if not player then return false end
+    return player:getValue("story_completed") == true or player:getValue("wormhole_guardian_destroyed") == true
+end
+
 local function grantKnowledgeItem(faction)
     if not faction then return false end
 
@@ -53,7 +58,7 @@ function GateConstructionHermitContact.onStartDiscussion()
     local player = Player()
 
     if not player then return end
-    if player:getValue("story_completed") ~= true then
+    if not hasGuardianProgress(player) then
         local preStory = {
             text = "You are still chasing bigger questions. Return to me after you cross the Barrier and defeat the Wormhole Guardian."%_t
         }
@@ -102,7 +107,7 @@ function GateConstructionHermitContact.onPayAvorion()
         invokeClientFunction(player, "showPaymentResult", false, "You don't have permission to discuss this with the Hermit."%_T)
         return
     end
-    if player:getValue("story_completed") ~= true then return end
+    if not hasGuardianProgress(player) then return end
 
     local payer = getInteractingFaction(callingPlayer, AlliancePrivilege.SpendResources)
     if not payer then
