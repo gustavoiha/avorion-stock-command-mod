@@ -5,8 +5,10 @@ Gate commissioning mission mod for Avorion.
 ## What it adds
 
 - New interaction at Research Stations: commission a gate connection between two sectors.
-- Gate construction progression is unlocked through Adventurer mail tied to the Wormhole Guardian storyline.
-- Distance-scaled downpayment in credits and one material tier.
+- Gate construction progression is unlocked through a post-Guardian Hermit consultation flow.
+- The Hermit provides a usable gate-knowledge item; using it unlocks gate commissioning for your faction.
+- Commissioning uses fixed credits + material downpayment only (no station goods bundle).
+- Any of your own core Research Stations can commission gates after the item is used.
 - Mission flow:
   - Wait for the research station to finish construction.
   - Interact with the inactive gate to start activation.

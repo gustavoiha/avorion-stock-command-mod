@@ -474,7 +474,7 @@ local function checkXsotanCount()
     return Player():getValue("gate_construction_xsotan_" .. tostring(c.missionId)) or 0
 end
 
-function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, ironAmount, triniumAmount, xanionAmount, avorionAmount, goodsName, goodsAmount)
+function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex, ax, ay, bx, by, creditsPaid, ironAmount, triniumAmount, xanionAmount, avorionAmount)
     initMissionCallbacks()
 
     if onClient() then
@@ -503,8 +503,6 @@ function initialize(stationIndex, builderFactionIndex, commissioningFactionIndex
         triniumAmount = triniumAmount,
         xanionAmount = xanionAmount,
         avorionAmount = avorionAmount,
-        goodsName = goodsName,
-        goodsAmount = goodsAmount,
         phase = 1,
         xsotanPoll = 0,
         invasionStarted = false,

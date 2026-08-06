@@ -6,7 +6,6 @@ include("stringutility")
 include("relations")
 include("faction")
 include("galaxy")
-include("goods")
 local Dialog = include("dialogutility")
 local GatesMap = include("gatesmap")
 
@@ -23,20 +22,6 @@ local FIXED_TRINIUM_AMOUNT = 20000
 local FIXED_XANION_AMOUNT = 20000
 local FIXED_AVORION_AMOUNT = 10000
 
-local FIXED_GOODS_REQUIREMENTS = {
-    {name = "Antigrav Generator", amount = 8},
-    {name = "Drill", amount = 8},
-    {name = "Electron Accelerator", amount = 7},
-    {name = "Force Generator", amount = 8},
-    {name = "Fusion Generator", amount = 7},
-    {name = "High Capacity Lens", amount = 7},
-    {name = "Neutron Accelerator", amount = 7},
-    {name = "Proton Accelerator", amount = 7},
-    {name = "Satellite", amount = 8},
-    {name = "Teleporter", amount = 7},
-    {name = "Turbine", amount = 7},
-}
-
 local function makeResourceVector()
     local result = {0, 0, 0, 0, 0, 0, 0}
     result[1] = FIXED_IRON_AMOUNT
@@ -52,69 +37,8 @@ local function distance2d(ax, ay, bx, by)
     return math.sqrt(dx * dx + dy * dy)
 end
 
-local function computeGoodsRequirements()
-    local requirements = {}
-    local totalValue = 0
-
-    for _, req in pairs(FIXED_GOODS_REQUIREMENTS) do
-        local def = goods[req.name]
-        local unitPrice = def and def.price or 0
-        local entry = {
-            name = req.name,
-            amount = req.amount,
-            unitPrice = unitPrice,
-            totalPrice = unitPrice * req.amount,
-        }
-
-        totalValue = totalValue + entry.totalPrice
-        table.insert(requirements, entry)
-    end
-
-    return requirements, totalValue
-end
-
-local function hasRequiredStationGoods(station, requirements)
-    for _, req in pairs(requirements) do
-        local def = goods[req.name]
-        if not def then
-            return false, "Missing goods definition for ${good}."%_T % {good = req.name}
-        end
-
-        local good = def:good()
-        local onStation = station:getCargoAmount(good)
-        if onStation < req.amount then
-            return false, "Research Station cargo missing ${need} ${good} (has ${have})."%_T % {
-                need = req.amount,
-                good = good:displayName(req.amount),
-                have = onStation,
-            }
-        end
-    end
-
-    return true
-end
-
-local function removeRequiredStationGoods(station, requirements)
-    for _, req in pairs(requirements) do
-        local def = goods[req.name]
-        if def then
-            station:removeCargo(def:good(), req.amount)
-        end
-    end
-end
-
-local function restoreRequiredStationGoods(station, requirements)
-    for _, req in pairs(requirements) do
-        local def = goods[req.name]
-        if def then
-            station:addCargo(def:good(), req.amount)
-        end
-    end
-end
-
 local function computeQuote(ax, ay, bx, by)
     local jumpDistance = distance2d(ax, ay, bx, by)
-    local goodsRequirements, goodsTotalValue = computeGoodsRequirements()
 
     return {
         jumpDistance = jumpDistance,
@@ -123,10 +47,6 @@ local function computeQuote(ax, ay, bx, by)
         triniumAmount = FIXED_TRINIUM_AMOUNT,
         xanionAmount = FIXED_XANION_AMOUNT,
         avorionAmount = FIXED_AVORION_AMOUNT,
-        goodsRequirements = goodsRequirements,
-        goodsTotalValue = goodsTotalValue,
-        goodsName = "Research Bundle",
-        goodsAmount = goodsTotalValue,
     }
 end
 
@@ -190,9 +110,16 @@ local function hasActiveMissionScript(player)
     return false
 end
 
-local function hasGateConstructionTheory(faction)
+local function hasHermitGateAccess(faction)
     if not faction then return false end
-    return faction:getValue("gate_construction_gate_theory_mail_sent") == true
+    return faction:getValue("gate_construction_hermit_gate_access") == true
+end
+
+local function hasHermitGateAccessForPlayer(player)
+    if not player then return false end
+    if hasHermitGateAccess(player) then return true end
+    if player.alliance and hasHermitGateAccess(player.alliance) then return true end
+    return false
 end
 
 local function isCoreResearchStation(station, buyer)
@@ -245,7 +172,7 @@ function GateCommissionHub.initUI()
     ui.useCurrentB = window:createButton(rowMapLister:nextRect(170), "B = Current Sector"%_T, "onCurrentB")
     ui.openMap = window:createButton(rowMapLister.inner, "Open Galaxy Map"%_T, "onOpenMap")
 
-    local quoteFrame = lister:nextRect(220)
+    local quoteFrame = lister:nextRect(250)
     window:createFrame(quoteFrame)
     local quoteLister = UIVerticalLister(quoteFrame, 8, 6)
 
@@ -255,8 +182,10 @@ function GateCommissionHub.initUI()
     ui.distanceLabel = window:createLabel(quoteLister:nextRect(18), "Route Distance: -"%_T, 12)
     ui.creditsLabel = window:createLabel(quoteLister:nextRect(18), "Credits Fee: -"%_T, 12)
     ui.resourcesLabel = window:createLabel(quoteLister:nextRect(18), "Material Downpayment: -"%_T, 12)
-    ui.goodsLabel = window:createLabel(quoteLister:nextRect(18), "Research Station Cargo Bay: -"%_T, 12)
-    ui.ruleLabel = window:createLabel(quoteLister:nextRect(18), "Rules: the station must be your own research station in the galactic core, and both endpoint sectors must be known."%_T, 12)
+    ui.unlockLabel = window:createLabel(quoteLister:nextRect(18), "Gate Knowledge: -"%_T, 12)
+    ui.ruleLabel = window:createTextField(quoteLister:nextRect(66), "Rules: the station must be your own research station in the galactic core, your faction must use the Hermit's gate-knowledge item, and both endpoint sectors must be known."%_T)
+    ui.ruleLabel.fontSize = 12
+    ui.ruleLabel.fontColor = ColorRGB(0.75, 0.75, 0.75)
     ui.warningLabel = window:createLabel(quoteLister:nextRect(54), "Warning: canceling the mission refunds material downpayment only. Credits are never refunded."%_T, 12)
     ui.warningLabel.color = ColorRGB(0.95, 0.7, 0.35)
 
@@ -347,10 +276,11 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
         xanion = quote.xanionAmount or 0,
         avorion = quote.avorionAmount or 0,
     }
-    ui.goodsLabel.caption = "Research Station Cargo Bay: ${types} required goods (~¢${value})"%_T % {
-        types = quote.goodsRequirements and #quote.goodsRequirements or 0,
-        value = createMonetaryString(quote.goodsTotalValue or 0),
-    }
+    if quote.hasHermitKnowledge == true then
+        ui.unlockLabel.caption = "Gate Knowledge: ✓ unlocked"%_T
+    else
+        ui.unlockLabel.caption = "Gate Knowledge: ✗ locked"%_T
+    end
 end
 
 function GateCommissionHub.onStartProject()
@@ -384,6 +314,7 @@ function GateCommissionHub.requestQuote(ax, ay, bx, by)
     end
 
     local quote = computeQuote(ax, ay, bx, by)
+    quote.hasHermitKnowledge = hasHermitGateAccessForPlayer(Player(callingPlayer))
     invokeClientFunction(Player(callingPlayer), "receiveQuote", true, quote, "")
 end
 callable(GateCommissionHub, "requestQuote")
@@ -419,9 +350,9 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
-    if not hasGateConstructionTheory(buyer) then
+    if not hasHermitGateAccess(buyer) then
         invokeClientFunction(player, "commissionResult", false,
-            "Our researchers cannot proceed yet. We suspect the wormhole in the center of the galaxy is tied to gate construction, but we need firmer proof before the station can begin a project of this scale.\n\nDestroy the Wormhole Guardian, then read the Adventurer's follow-up mail. Once the core research station has confirmed the theory, we can accept your commission."%_T)
+            "Our researchers cannot proceed yet. Speak with the Hermit, receive his gate-knowledge item, and use it to unlock commissioning for your faction."%_T)
         return
     end
 
@@ -449,14 +380,6 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
-    local goodsOk, goodsErr = hasRequiredStationGoods(station, quote.goodsRequirements or {})
-    if not goodsOk then
-        invokeClientFunction(player, "commissionResult", false, goodsErr)
-        return
-    end
-
-    removeRequiredStationGoods(station, quote.goodsRequirements or {})
-
     buyer:pay("Paid gate construction downpayment."%_T, quote.credits, unpack(resources))
 
     local scriptIndex = player:addScript("data/scripts/player/missions/gateconstruction.lua",
@@ -469,12 +392,9 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         quote.ironAmount,
         quote.triniumAmount,
         quote.xanionAmount,
-        quote.avorionAmount,
-        quote.goodsName,
-        quote.goodsAmount)
+        quote.avorionAmount)
 
     if not scriptIndex then
-        restoreRequiredStationGoods(station, quote.goodsRequirements or {})
         buyer:receive("Refunded gate construction downpayment."%_T, quote.credits, unpack(resources))
         invokeClientFunction(player, "commissionResult", false, "Could not start the gate construction mission."%_T)
         return
