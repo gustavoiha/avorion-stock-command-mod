@@ -131,7 +131,11 @@ local function isCoreResearchStation(station, buyer)
 end
 
 function GateCommissionHub.interactionPossible(playerIndex, option)
-    return CheckFactionInteraction(playerIndex, GateCommissionHub.interactionThreshold)
+    if not CheckFactionInteraction(playerIndex, GateCommissionHub.interactionThreshold) then
+        return false
+    end
+    local player = Player(playerIndex)
+    return hasHermitGateAccessForPlayer(player)
 end
 
 function GateCommissionHub.initUI()
