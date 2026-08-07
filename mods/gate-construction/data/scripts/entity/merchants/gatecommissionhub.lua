@@ -100,16 +100,6 @@ local function validateEndpoints(ax, ay, bx, by)
     return true
 end
 
-local function hasActiveMissionScript(player)
-    for _, script in pairs({player:getScripts()}) do
-        if string.find(script, "player/missions/gateconstruction.lua", 1, true) then
-            return true
-        end
-    end
-
-    return false
-end
-
 local function isCoreResearchStation(station, buyer)
     if not station or not buyer then return false end
     if station.factionIndex ~= buyer.index then return false end
@@ -127,9 +117,9 @@ local function hasLegendaryWormholePowerDiverter(station)
     for upgrade, permanent in pairs(systems:getUpgrades()) do
         if upgrade
                 and permanent == true
-                and upgrade.itemType == InventoryItemType.SystemUpgrade
                 and upgrade.rarity
                 and upgrade.rarity.value == RarityType.Legendary
+                and upgrade.script
                 and (upgrade.script == "data/scripts/systems/wormholeopener.lua" or upgrade.script == "systems/wormholeopener.lua") then
             return true
         end
@@ -382,8 +372,8 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
-    if hasActiveMissionScript(player) then
-        invokeClientFunction(player, "commissionResult", false, "You already have an active gate construction mission."%_T)
+    if station:getValue("gate_construction_busy") then
+        invokeClientFunction(player, "commissionResult", false, "This research station already has an active gate project in progress."%_T)
         return
     end
 
@@ -426,7 +416,9 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
         return
     end
 
+    station:setValue("gate_construction_busy", true)
+
     invokeClientFunction(player, "commissionResult", true,
-        "Contract signed. The research station will begin building the inactive gate in the destination sector. Track your mission objectives for next steps."%_T)
+        "Contract signed. The gate will be active in 5 minutes. Expect a Xsotan assault near sector 0:0 upon completion. Track your mission objectives for next steps."%_T)
 end
 callable(GateCommissionHub, "startCommission")

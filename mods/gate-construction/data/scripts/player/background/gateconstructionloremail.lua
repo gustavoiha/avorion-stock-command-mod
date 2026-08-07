@@ -312,6 +312,10 @@ function GateConstructionLoreMail.initialize()
     maybeSendMailUpdates(player)
 end
 
+function GateConstructionLoreMail.getUpdateInterval()
+    return 30
+end
+
 function GateConstructionLoreMail.updateServer(timeStep)
     if not Player() then return end
     maybeSendMailUpdates(Player())
