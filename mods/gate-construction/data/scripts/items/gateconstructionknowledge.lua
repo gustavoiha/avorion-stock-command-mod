@@ -14,7 +14,7 @@ end
 function create(item, rarity, factionIndex)
     item.stackable = false
     item.depleteOnUse = true
-    item.name = "Hermit's Gate Theory Notes"%_t
+    item.name = "Archived Gate Theory Notes"%_t
     item.price = 1000
     item.icon = "data/textures/icons/energy-arrow.png"
     item.rarity = rarity
@@ -45,17 +45,17 @@ function create(item, rarity, factionIndex)
     tooltip:addLine(TooltipLine(14, 14))
 
     local l1 = TooltipLine(20, 14)
-    l1.ltext = "Unlocks gate commissioning research for your faction."%_t
+    l1.ltext = "Legacy item kept for save compatibility."%_t
     tooltip:addLine(l1)
 
     local l2 = TooltipLine(20, 14)
-    l2.ltext = "After use, your own core Research Stations can commission gates."%_t
+    l2.ltext = "No longer unlocks gate commissioning."%_t
     tooltip:addLine(l2)
 
     tooltip:addLine(TooltipLine(14, 14))
 
     local useLine = TooltipLine(20, 15)
-    useLine.ltext = "Depleted on Use"%_t
+    useLine.ltext = "Deprecated"%_t
     useLine.lcolor = ColorRGB(1.0, 1.0, 0.3)
     tooltip:addLine(useLine)
 
@@ -86,15 +86,8 @@ function activate(item)
         return false
     end
 
-    if faction:getValue("gate_construction_hermit_gate_access") == true then
-        player:sendChatMessage(""%_T, ChatMessageType.Information, "Your faction already integrated this gate knowledge."%_T)
-        return false
-    end
-
-    faction:setValue("gate_construction_hermit_gate_access", true)
-
     player:sendChatMessage(""%_T, ChatMessageType.Information,
-        "You integrated the Hermit's gate theory notes. Your own core Research Stations can now commission gate construction."%_T)
+        "This item is deprecated. Gate commissioning now depends on your own Research Station in sector 0:0 with a permanently installed legendary Wormhole Power Diverter."%_T)
 
     return true
 end

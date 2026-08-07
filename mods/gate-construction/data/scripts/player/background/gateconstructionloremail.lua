@@ -15,24 +15,9 @@ local data = {
 local guardianMailId = "Story_Kill_Guardian_Mission"
 local guardianHintMailId = "gate_construction_guardian_hint_mail"
 local guardianHermitFollowupMailId = "gate_construction_guardian_hermit_followup_mail_v2"
-local hermitContactScript = "data/scripts/entity/story/gateconstructionhermitcontact.lua"
 
 local resolvedHermitXKey = "gate_construction_resolved_hermit_x_v2"
 local resolvedHermitYKey = "gate_construction_resolved_hermit_y_v2"
-
-local function getFactionHermitUnlock(player)
-    if not player then return false end
-
-    if player:getValue("gate_construction_hermit_gate_access") == true then
-        return true
-    end
-
-    if player.alliance and player.alliance:getValue("gate_construction_hermit_gate_access") == true then
-        return true
-    end
-
-    return false
-end
 
 local function hasGuardianProgress(player)
     if not player then return false end
@@ -245,41 +230,6 @@ local function resolveHermitLocationForPlayer(player)
     return nil, nil
 end
 
-local function ensureHermitContactInCurrentSector(player)
-    if not player then return end
-    if not hasGuardianProgress(player) then return end
-    if getFactionHermitUnlock(player) then return end
-
-    local hermit = Sector():getEntitiesByScript("data/scripts/entity/story/hermit.lua")
-    if valid(hermit) then
-        hermit:addScriptOnce(hermitContactScript)
-    end
-end
-
-local function maybeSpawnHermitForCurrentSector(player)
-    if not player then return end
-    if not hasGuardianProgress(player) then return end
-    if getFactionHermitUnlock(player) then return end
-
-    local px, py = player:getSectorCoordinates()
-    if not px or not py then return end
-
-    local hx, hy = resolveHermitLocationForPlayer(player)
-    if not hx or not hy then return end
-    if px ~= hx or py ~= hy then return end
-
-    local hermit = Sector():getEntitiesByScript("data/scripts/entity/story/hermit.lua")
-    if valid(hermit) then
-        hermit:addScriptOnce(hermitContactScript)
-        return
-    end
-
-    hermit = Hermit.spawn()
-    if valid(hermit) then
-        hermit:addScriptOnce(hermitContactScript)
-    end
-end
-
 local function hasMail(player, mailId)
     local mails = {player:getMailsById(mailId)}
     return mails[1] ~= nil
@@ -352,7 +302,6 @@ local function maybeSendMailUpdates(player)
         end
     end
 
-    maybeSpawnHermitForCurrentSector(player)
 end
 
 function GateConstructionLoreMail.initialize()
@@ -365,14 +314,12 @@ end
 
 function GateConstructionLoreMail.updateServer(timeStep)
     if not Player() then return end
-    ensureHermitContactInCurrentSector(Player())
     maybeSendMailUpdates(Player())
 end
 
 function GateConstructionLoreMail.onSectorEntered(x, y)
     if not Player() then return end
-    ensureHermitContactInCurrentSector(Player())
-    maybeSpawnHermitForCurrentSector(Player())
+    maybeSendMailUpdates(Player())
 end
 
 function GateConstructionLoreMail.secure()

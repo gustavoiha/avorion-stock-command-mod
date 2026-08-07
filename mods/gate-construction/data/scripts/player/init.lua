@@ -2,6 +2,6 @@
 -- Injected into vanilla player/init.lua.
 
 if onServer() then
-    local player = Player()
-    player:addScriptOnce("background/gateconstructionloremail.lua")
+	local player = Player()
+	player:addScriptOnce("background/gateconstructionloremail.lua")
 end

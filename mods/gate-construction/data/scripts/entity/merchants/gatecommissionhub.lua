@@ -110,32 +110,53 @@ local function hasActiveMissionScript(player)
     return false
 end
 
-local function hasHermitGateAccess(faction)
-    if not faction then return false end
-    return faction:getValue("gate_construction_hermit_gate_access") == true
-end
-
-local function hasHermitGateAccessForPlayer(player)
-    if not player then return false end
-    if hasHermitGateAccess(player) then return true end
-    if player.alliance and hasHermitGateAccess(player.alliance) then return true end
-    return false
-end
-
 local function isCoreResearchStation(station, buyer)
     if not station or not buyer then return false end
     if station.factionIndex ~= buyer.index then return false end
 
     local x, y = station:getCoordinates()
-    return Galaxy():isCentralFactionArea(x, y)
+    return x == 0 and y == 0
+end
+
+local function hasLegendaryWormholePowerDiverter(station)
+    if not station then return false end
+
+    local systems = ShipSystem(station)
+    if not systems or not systems.getUpgrades then return false end
+
+    for upgrade, permanent in pairs(systems:getUpgrades()) do
+        if upgrade
+                and permanent == true
+                and upgrade.itemType == InventoryItemType.SystemUpgrade
+                and upgrade.rarity
+                and upgrade.rarity.value == RarityType.Legendary
+                and (upgrade.script == "data/scripts/systems/wormholeopener.lua" or upgrade.script == "systems/wormholeopener.lua") then
+            return true
+        end
+    end
+
+    return false
 end
 
 function GateCommissionHub.interactionPossible(playerIndex, option)
     if not CheckFactionInteraction(playerIndex, GateCommissionHub.interactionThreshold) then
         return false
     end
+
     local player = Player(playerIndex)
-    return hasHermitGateAccessForPlayer(player)
+    local station = Entity()
+    if not player or not station then return false end
+
+    local ownerOk = station.factionIndex == player.index
+    if not ownerOk and player.alliance then
+        ownerOk = station.factionIndex == player.alliance.index
+    end
+    if not ownerOk then return false end
+
+    local x, y = station:getCoordinates()
+    if x ~= 0 or y ~= 0 then return false end
+
+    return hasLegendaryWormholePowerDiverter(station)
 end
 
 function GateCommissionHub.initUI()
@@ -186,8 +207,8 @@ function GateCommissionHub.initUI()
     ui.distanceLabel = window:createLabel(quoteLister:nextRect(18), "Route Distance: -"%_T, 12)
     ui.creditsLabel = window:createLabel(quoteLister:nextRect(18), "Credits Fee: -"%_T, 12)
     ui.resourcesLabel = window:createLabel(quoteLister:nextRect(18), "Material Downpayment: -"%_T, 12)
-    ui.unlockLabel = window:createLabel(quoteLister:nextRect(18), "Gate Knowledge: -"%_T, 12)
-    ui.ruleLabel = window:createTextField(quoteLister:nextRect(66), "Rules: the station must be your own research station in the galactic core, your faction must use the Hermit's gate-knowledge item, and both endpoint sectors must be known."%_T)
+    ui.unlockLabel = window:createLabel(quoteLister:nextRect(18), "Wormhole Power Diverter: -"%_T, 12)
+    ui.ruleLabel = window:createTextField(quoteLister:nextRect(66), "Rules: the station must be your own Research Station in sector 0:0, the station must have a permanently installed legendary Wormhole Power Diverter, and both endpoint sectors must be known."%_T)
     ui.ruleLabel.fontSize = 12
     ui.ruleLabel.fontColor = ColorRGB(0.75, 0.75, 0.75)
     ui.warningLabel = window:createLabel(quoteLister:nextRect(54), "Warning: canceling the mission refunds material downpayment only. Credits are never refunded."%_T, 12)
@@ -280,10 +301,10 @@ function GateCommissionHub.receiveQuote(ok, quote, err)
         xanion = quote.xanionAmount or 0,
         avorion = quote.avorionAmount or 0,
     }
-    if quote.hasHermitKnowledge == true then
-        ui.unlockLabel.caption = "Gate Knowledge: ✓ unlocked"%_T
+    if quote.hasWormholePowerDiverter == true then
+        ui.unlockLabel.caption = "Wormhole Power Diverter: ✓ installed"%_T
     else
-        ui.unlockLabel.caption = "Gate Knowledge: ✗ locked"%_T
+        ui.unlockLabel.caption = "Wormhole Power Diverter: ✗ missing"%_T
     end
 end
 
@@ -318,7 +339,8 @@ function GateCommissionHub.requestQuote(ax, ay, bx, by)
     end
 
     local quote = computeQuote(ax, ay, bx, by)
-    quote.hasHermitKnowledge = hasHermitGateAccessForPlayer(Player(callingPlayer))
+    local station = Entity()
+    quote.hasWormholePowerDiverter = hasLegendaryWormholePowerDiverter(station)
     invokeClientFunction(Player(callingPlayer), "receiveQuote", true, quote, "")
 end
 callable(GateCommissionHub, "requestQuote")
@@ -350,13 +372,13 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
 
     if not isCoreResearchStation(station, buyer) then
         invokeClientFunction(player, "commissionResult", false,
-            "This gate project can only be commissioned from your own Research Station in the galactic core."%_T)
+            "This gate project can only be commissioned from your own Research Station in sector 0:0."%_T)
         return
     end
 
-    if not hasHermitGateAccess(buyer) then
+    if not hasLegendaryWormholePowerDiverter(station) then
         invokeClientFunction(player, "commissionResult", false,
-            "Our researchers cannot proceed yet. Speak with the Hermit, receive his gate-knowledge item, and use it to unlock commissioning for your faction."%_T)
+            "This Research Station needs a permanently installed legendary Wormhole Power Diverter before it can commission gate construction."%_T)
         return
     end
 

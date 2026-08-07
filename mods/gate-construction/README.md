@@ -5,10 +5,11 @@ Gate commissioning mission mod for Avorion.
 ## What it adds
 
 - New interaction at Research Stations: commission a gate connection between two sectors.
-- Gate construction progression is unlocked through a post-Guardian Hermit consultation flow.
-- The Hermit provides a usable gate-knowledge item; using it unlocks gate commissioning for your faction.
+- Gate commissioning does not require speaking with the Hermit.
+- Commissioning is available only at your own (player/alliance-owned) Research Station in sector `0:0`.
+- That station must have a permanently installed legendary Wormhole Power Diverter (Xsotan Wormhole Generator).
 - Commissioning uses fixed credits + material downpayment only (no station goods bundle).
-- Any of your own core Research Stations can commission gates after the item is used.
+- Endpoint sectors must be known before commissioning.
 - Mission flow:
   - Wait for the research station to finish construction.
   - Interact with the inactive gate to start activation.
