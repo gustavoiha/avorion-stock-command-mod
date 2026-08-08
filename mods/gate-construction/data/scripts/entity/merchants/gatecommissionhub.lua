@@ -104,7 +104,7 @@ local function isCoreResearchStation(station, buyer)
     if not station or not buyer then return false end
     if station.factionIndex ~= buyer.index then return false end
 
-    local x, y = station:getCoordinates()
+    local x, y = Sector():getCoordinates()
     return x == 0 and y == 0
 end
 
@@ -143,10 +143,10 @@ function GateCommissionHub.interactionPossible(playerIndex, option)
     end
     if not ownerOk then return false end
 
-    local x, y = station:getCoordinates()
+    local x, y = Sector():getCoordinates()
     if x ~= 0 or y ~= 0 then return false end
 
-    return hasLegendaryWormholePowerDiverter(station)
+    return true
 end
 
 function GateCommissionHub.initUI()
