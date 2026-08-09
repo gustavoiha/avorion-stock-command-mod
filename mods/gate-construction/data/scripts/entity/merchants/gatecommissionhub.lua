@@ -242,57 +242,6 @@ function run(factionIndex, tx, ty)
 end
 ]]
 
--- The Xsotan wave is generated asynchronously, so it has to run in this script's own
--- (persistent) state: a chunk passed to runSectorCode is discarded as soon as it returns
--- and the generator's callback would never fire. The station sits in 0:0 anyway.
-function GateCommissionHub.spawnXsotanInvasion()
-    local AsyncXsotanGenerator = include("asyncxsotangenerator")
-    local SpawnUtility = include("spawnutility")
-
-    local volumes = {1, 1, 2, 3, 3, 5, 3, 3, 2, 1, 1}
-
-    -- Match the regular large invasion shape and spawn it twice.
-    local wave = {}
-    for i = 1, 2 do
-        for _, size in pairs(volumes) do
-            table.insert(wave, size)
-        end
-    end
-
-    -- Held on the namespace so the generator outlives this call and its async callback fires.
-    local generator = AsyncXsotanGenerator(GateCommissionHub, function(generated)
-        SpawnUtility.addEnemyBuffs(generated)
-
-        local builderFactionIndex = Entity().factionIndex
-
-        for _, xsotan in pairs(generated) do
-            local shipAI = ShipAI(xsotan.id)
-
-            shipAI:registerEnemyFaction(builderFactionIndex)
-            for _, player in pairs({Sector():getPlayers()}) do
-                shipAI:registerEnemyFaction(player.index)
-            end
-
-            shipAI:setAggressive()
-        end
-
-        GateCommissionHub.xsotanGenerator = nil
-    end)
-    GateCommissionHub.xsotanGenerator = generator
-
-    local dir = normalize(vec3(getFloat(-1, 1), getFloat(-1, 1), getFloat(-1, 1)))
-    local up = vec3(0, 1, 0)
-    local right = normalize(cross(dir, up))
-    local pos = dir * 1500
-
-    generator:startBatch()
-    for _, size in pairs(wave) do
-        generator:createShip(MatrixLookUpPosition(-dir, up, pos), size)
-        pos = pos + right * 95
-    end
-    generator:endBatch()
-end
-
 -- Fires a guardian-style channel beam from the Research Station into the galactic
 -- core, replicating the wormhole-harnessing effect used by the Wormhole Guardian.
 -- createLaser() is client-only, so the server just broadcasts.
@@ -454,11 +403,9 @@ function GateCommissionHub.finishProject()
     if player then
         -- sendChatMessage substitutes %1%-style placeholders, not ${named} ones.
         player:sendChatMessage(station, ChatMessageType.Normal,
-            "Gate construction complete. The gates linking (%1%:%2%) and (%3%:%4%) are now online. Brace yourself - the harnessed wormhole energy has drawn a Xsotan wave into this sector!"%_T,
+            "Gate construction complete. The gates linking (%1%:%2%) and (%3%:%4%) are now online."%_T,
             a.x, a.y, b.x, b.y)
     end
-
-    GateCommissionHub.spawnXsotanInvasion()
 end
 
 function GateCommissionHub.updateActivation()
@@ -521,7 +468,7 @@ function GateCommissionHub.initUI()
 
     local introRect = lister:nextRect(96)
     ui.intro = window:createTextField(introRect,
-        "Commissioning a gate is expensive and dangerous. This station needs ${m} minutes to bring the new link online, and construction continues even while you are away. Activating the link attracts a large Xsotan wave, so have your fleet ready."%_t % {m = BUILD_TIME_MINUTES})
+        "Commissioning a gate is expensive. This station needs ${m} minutes to bring the new link online, and construction continues even while you are away."%_t % {m = BUILD_TIME_MINUTES})
     ui.intro.fontSize = 13
     ui.intro.fontColor = ColorRGB(0.7, 0.7, 0.7)
 
@@ -847,7 +794,7 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
 
     invokeClientFunction(player, "receiveStatus", true, ax, ay, bx, by, BUILD_TIME)
     player:sendChatMessage(station, ChatMessageType.Normal,
-        "Thank you for your purchase. The gates will be constructed in about %1% minutes. Expect a Xsotan assault near sector 0:0 once the link goes online."%_T,
+        "Thank you for your purchase. The gates will be constructed in about %1% minutes."%_T,
         BUILD_TIME_MINUTES)
 end
 callable(GateCommissionHub, "startCommission")

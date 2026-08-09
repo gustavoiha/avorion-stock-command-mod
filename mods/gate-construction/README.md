@@ -13,7 +13,7 @@ Gate commissioning mod for Avorion.
 - Construction flow (no mission involved):
   - The station queues the project and runs a 5 minute construction timer.
   - The timer keeps running while you are away; elapsed time is applied when sector `0:0` reloads.
-  - When it completes, both gates spawn and a strong Xsotan wave attacks sector `0:0`.
+  - When it completes, both gates spawn.
 - The commission window shows the live remaining build time and blocks new commissions while one is queued.
 
 ## Folder contents
