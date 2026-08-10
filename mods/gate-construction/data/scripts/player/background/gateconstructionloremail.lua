@@ -251,6 +251,7 @@ end
 
 local function maybeSendMailUpdates(player)
     if not player then return end
+    if not onServer() then return end -- getMailsById and addMail are server-only.
 
     local guardianMail = hasMail(player, guardianMailId)
     local guardianProgress = hasGuardianProgress(player)

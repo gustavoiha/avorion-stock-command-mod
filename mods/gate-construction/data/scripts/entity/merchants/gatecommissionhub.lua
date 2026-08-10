@@ -11,6 +11,7 @@ include("galaxy")
 local Dialog = include("dialogutility")
 local GatesMap = include("gatesmap")
 local GateConstructionLinks = include("gateconstructionlinks")
+local GateInfluence = include("gateinfluence")
 
 -- Don't remove or alter the following comment, it tells the game the namespace this script lives in.
 -- namespace GateCommissionHub
@@ -27,6 +28,7 @@ local FIXED_OGONITE_AMOUNT = 200000
 local FIXED_AVORION_AMOUNT = 100000
 
 local BUILD_TIME = 5 * 60
+
 local BUILD_TIME_MINUTES = math.max(1, math.ceil(BUILD_TIME / 60))
 
 -- The harnessing beam is timed to stop exactly when the gates come online.
@@ -394,6 +396,7 @@ function GateCommissionHub.finishProject()
     GateCommissionHub.data.project = nil
 
     GateConstructionLinks.add(a.x, a.y, b.x, b.y)
+    GateInfluence.onLinkCompleted(a.x, a.y, b.x, b.y)
     updateGateMaps(project)
 
     local station = Entity()
@@ -430,7 +433,10 @@ end
 
 function GateCommissionHub.updateServer(timeStep)
     local project = getProject()
-    if not project then return end
+    if not project then
+        GateInfluence.processExpansion(1)
+        return
+    end
 
     if project.activating then
         GateCommissionHub.updateActivation()
