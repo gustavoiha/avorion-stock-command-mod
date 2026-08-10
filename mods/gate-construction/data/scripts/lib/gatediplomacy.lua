@@ -12,7 +12,8 @@ local GateInfluence = include("gateinfluence")
 local GateDiplomacy = {}
 
 GateDiplomacy.RelationsGift = 50000
-GateDiplomacy.CreditsGift = 10000000
+GateDiplomacy.CreditsGiftMin = 20000000
+GateDiplomacy.CreditsGiftMax = 40000000
 
 -- Gates are permanent, so a faction that has crossed the barrier never uncrosses it.
 -- Both values are append-only and safe to replay.
@@ -45,7 +46,7 @@ local function sendThankYouMail(player, faction)
     mail.id = "gate_construction_barrier_thanks_" .. faction.index
     mail.header = "A road through the barrier"%_T
     mail.sender = faction.name
-    mail.money = GateDiplomacy.CreditsGift
+    mail.money = random():getInt(GateDiplomacy.CreditsGiftMin, GateDiplomacy.CreditsGiftMax)
     mail.text = Format("For generations the barrier was the edge of everything we could reach. \z
 Your gates changed that. Ships that were never coming back are on our docks again.\n\n\z
 Attached is a payment from our treasury. It does not cover what you have opened up for us, \z
