@@ -12,6 +12,7 @@ local Dialog = include("dialogutility")
 local GatesMap = include("gatesmap")
 local GateConstructionLinks = include("gateconstructionlinks")
 local GateInfluence = include("gateinfluence")
+local GateDiplomacy = include("gatediplomacy")
 
 -- Don't remove or alter the following comment, it tells the game the namespace this script lives in.
 -- namespace GateCommissionHub
@@ -397,6 +398,7 @@ function GateCommissionHub.finishProject()
 
     GateConstructionLinks.add(a.x, a.y, b.x, b.y)
     GateInfluence.onLinkCompleted(a.x, a.y, b.x, b.y)
+    GateDiplomacy.onLinkCompleted(playerIndex)
     updateGateMaps(project)
 
     local station = Entity()
@@ -434,7 +436,7 @@ end
 function GateCommissionHub.updateServer(timeStep)
     local project = getProject()
     if not project then
-        GateInfluence.processExpansion(1)
+        GateDiplomacy.processPending(GateInfluence.processExpansion(1))
         return
     end
 

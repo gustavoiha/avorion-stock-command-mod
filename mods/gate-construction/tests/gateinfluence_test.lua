@@ -268,6 +268,41 @@ check("gate faction that IS the local faction is excluded (matches the roll)",
     #selfOwned.foreign == 0 and approx(selfOwned.localProbability, 1.0),
     string.format("%i foreign", #selfOwned.foreign))
 
+-- ==========================================================================
+-- getCrossBarrierFactions  (decides who sends the thank-you gift)
+-- ==========================================================================
+
+print("\n[barrier] thank-you trigger: reaching the far side within 3 hops")
+
+local function crossing()
+    local set = GateInfluence.getCrossBarrierFactions()
+    local list = {}
+    for index, _ in pairs(set) do table.insert(list, index) end
+    table.sort(list)
+    return set, table.concat(list, ",")
+end
+
+reset()
+link(140, 0, 160, 0); own(140, 0, 1); own(160, 0, 2)
+local crossed, crossedLabel = crossing()
+check("a 1-hop crossing credits BOTH sides", crossed[1] and crossed[2], crossedLabel)
+
+reset()
+link(0, 0, 45, 0); own(0, 0, 1); own(45, 0, 2)
+local _, sameSide = crossing()
+check("two factions on the SAME side never trigger", sameSide == "", sameSide)
+
+reset()
+link(0, 0, 40, 0); link(40, 0, 80, 0); link(80, 0, 120, 0); link(120, 0, 160, 0)
+own(0, 0, 1); own(160, 0, 2)
+local _, tooFar = crossing()
+check("a crossing that needs 4 hops does NOT trigger", tooFar == "", tooFar)
+
+link(0, 0, 80, 0)   -- shortcut: the very same pair now sits 3 hops apart
+local shortened, shortenedLabel = crossing()
+check("a later gate shortening 4 hops to 3 DOES trigger",
+    shortened[1] and shortened[2], shortenedLabel)
+
 print("")
 if failures == 0 then
     print("ALL INFLUENCE TESTS PASSED")

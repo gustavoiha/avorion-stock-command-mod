@@ -340,4 +340,54 @@ function GateInfluence.processExpansion(maxNodes)
     return next(queue) ~= nil
 end
 
+-- Factions that can currently reach a faction on the opposite side of the barrier within
+-- MaxHops. A faction's side is decided by the graph node it owns, never by its home
+-- sector: what matters is which end of the gate network it actually sits on.
+-- Returned as a set of faction indices so callers can diff it against what they know.
+function GateInfluence.getCrossBarrierFactions()
+    local adjacency = buildAdjacency()
+
+    local owners = {}
+    for key, _ in pairs(adjacency) do
+        local x, y = parseNode(key)
+        if x then
+            local faction = ownerOf(x, y)
+            if faction then
+                owners[key] = {index = faction.index, inside = GateInfluence.isInsideBarrier(x, y)}
+            end
+        end
+    end
+
+    local connected = {}
+
+    for originKey, origin in pairs(owners) do
+        local visited = {[originKey] = true}
+        local frontier = {originKey}
+
+        for _ = 1, GateInfluence.MaxHops do
+            local nextFrontier = {}
+
+            for _, current in ipairs(frontier) do
+                for neighbor, _ in pairs(adjacency[current] or {}) do
+                    if not visited[neighbor] then
+                        visited[neighbor] = true
+                        table.insert(nextFrontier, neighbor)
+
+                        -- Both ends gain the crossing, so credit them together.
+                        local other = owners[neighbor]
+                        if other and other.inside ~= origin.inside and other.index ~= origin.index then
+                            connected[origin.index] = true
+                            connected[other.index] = true
+                        end
+                    end
+                end
+            end
+
+            frontier = nextFrontier
+        end
+    end
+
+    return connected
+end
+
 return GateInfluence
