@@ -1,0 +1,16 @@
+{
+    "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+    "runtime.version": "Lua 5.2",
+    "runtime.special": {
+        "include": "require"
+    },
+    "runtime.path": [
+        "?.lua",
+        "?/init.lua"
+    ],
+    "runtime.pathStrict": false,
+    "workspace.library": [
+        "~/Library/Application Support/Steam/steamapps/common/Avorion/data/scripts"
+    ],
+    "workspace.checkThirdParty": false
+}
