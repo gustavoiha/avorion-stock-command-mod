@@ -9,10 +9,11 @@ meta =
         .. "Requires a player/alliance-owned Research Station in sector 0:0 with a permanently installed "
         .. "legendary Wormhole Power Diverter (Xsotan Wormhole Generator). "
         .. "Uses fixed credits + material downpayment and setup time scaling by "
-        .. "endpoint distance.",
+        .. "endpoint distance. Construction delivers inactive gates; a ship carrying an "
+        .. "installed XSTN-K I has to activate them before the link goes live.",
 
     authors = {"Gugs_Iha"},
-    version = "1.4",
+    version = "1.5",
 
     dependencies = {
     },

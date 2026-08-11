@@ -11,6 +11,7 @@ include("galaxy")
 local Dialog = include("dialogutility")
 local GatesMap = include("gatesmap")
 local GateConstructionLinks = include("gateconstructionlinks")
+local GateConstructionMap = include("gateconstructionmap")
 local GateInfluence = include("gateinfluence")
 local GateDiplomacy = include("gatediplomacy")
 
@@ -92,6 +93,7 @@ end
 
 local function sectorsAlreadyGateConnected(ax, ay, bx, by)
     if GateConstructionLinks.exists(ax, ay, bx, by) then return true end
+    if GateConstructionLinks.existsPending(ax, ay, bx, by) then return true end
 
     local map = GatesMap(Server().seed)
 
@@ -165,83 +167,14 @@ local function hasLegendaryWormholePowerDiverter(station)
     return false
 end
 
-local spawnActiveGateCode = [[
+local spawnInactiveGateCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 package.path = package.path .. ";data/scripts/?.lua"
 
-include("galaxy")
-local PlanGenerator = include("plangenerator")
-local StyleGenerator = include("internal/stylegenerator.lua")
+local GateConstructionGates = include("gateconstructiongates")
 
-function run(factionIndex, tx, ty)
-    local x, y = Sector():getCoordinates()
-
-    local faction = Faction(factionIndex) or Galaxy():getNearestFaction(x, y)
-    if not faction then return end
-
-    local desc = EntityDescriptor()
-    desc:addComponents(
-       ComponentType.Plan,
-       ComponentType.BspTree,
-       ComponentType.Intersection,
-       ComponentType.Asleep,
-       ComponentType.DamageContributors,
-       ComponentType.BoundingSphere,
-       ComponentType.PlanMaxDurability,
-       ComponentType.Durability,
-       ComponentType.BoundingBox,
-       ComponentType.Velocity,
-       ComponentType.Physics,
-       ComponentType.Scripts,
-       ComponentType.ScriptCallback,
-       ComponentType.Title,
-       ComponentType.Owner,
-       ComponentType.FactionNotifier,
-       ComponentType.WormHole,
-       ComponentType.EnergySystem,
-       ComponentType.EntityTransferrer
-    )
-
-    local styleGenerator = StyleGenerator(faction.index)
-    local c1 = styleGenerator.factionDetails.baseColor
-    local c2 = ColorRGB(0.25, 0.25, 0.25)
-    local c3 = styleGenerator.factionDetails.paintColor
-    c1 = ColorRGB(c1.r, c1.g, c1.b)
-    c3 = ColorRGB(c3.r, c3.g, c3.b)
-
-    local plan = PlanGenerator.makeGatePlan(Seed(faction.index) + Server().seed, c1, c2, c3)
-
-    local dir = vec3(tx - x, 0, ty - y)
-    if dir.x == 0 and dir.z == 0 then
-        dir = vec3(1, 0, 0)
-    else
-        normalize_ip(dir)
-    end
-
-    local position = MatrixLookUp(dir, vec3(0, 1, 0))
-    position.pos = dir * 3000
-
-    desc:setMovePlan(plan)
-    desc.position = position
-    desc.factionIndex = faction.index
-    desc.invincible = true
-    desc:addScript("data/scripts/entity/gate.lua")
-
-    local wormhole = desc:getComponent(ComponentType.WormHole)
-    wormhole:setTargetCoordinates(tx, ty)
-    wormhole.visible = false
-    wormhole.visualSize = 50
-    wormhole.passageSize = 50
-    wormhole.oneWay = true
-
-    -- Without this marker, sector/background/gatecompatibility.lua wipes every gate in
-    -- the sector on the next load and regenerates only the ones in the vanilla gates map.
-    Sector():setValue("gates2.0", true)
-
-    local gate = Sector():createEntity(desc)
-    if valid(gate) then
-        gate:setValue("gate_construction_active_gate", true)
-    end
+function run(factionIndex, tx, ty, commissioningPlayerIndex)
+    GateConstructionGates.createInactive(factionIndex, tx, ty, commissioningPlayerIndex)
 end
 ]]
 
@@ -327,7 +260,7 @@ end
 
 -- runSectorCode only works on sectors that are already in memory, so an endpoint
 -- has to be loaded first. Loading is asynchronous, hence the retry loop.
-local function spawnGateIn(project, x, y, tx, ty)
+local function spawnInactiveGateIn(project, x, y, tx, ty)
     local galaxy = Galaxy()
 
     if not galaxy:sectorLoaded(x, y) then
@@ -338,51 +271,14 @@ local function spawnGateIn(project, x, y, tx, ty)
     -- Keep it around long enough for the queued code to actually run.
     galaxy:keepSector(x, y, 30)
 
-    local result = runSectorCode(x, y, true, spawnActiveGateCode, "run",
-        project.builderFactionIndex, tx, ty)
+    local result = runSectorCode(x, y, true, spawnInactiveGateCode, "run",
+        project.builderFactionIndex, tx, ty, project.commissioningPlayerIndex)
 
     if result ~= nil and result ~= 0 then
         return false
     end
 
     return true
-end
-
--- The galaxy map is drawn from stored sector views, so the new link stays invisible
--- until it is written into them (same approach as the Gate Map Upgrade item).
-local function registerGateOnMap(faction, x, y, tx, ty)
-    -- Only Player and Alliance carry sector views; a plain Faction does not.
-    if not faction or not faction.getKnownSector then return end
-
-    local view = faction:getKnownSector(x, y)
-    if not view then return end
-
-    local destinations = {view:getGateDestinations()}
-    for _, destination in pairs(destinations) do
-        if destination.x == tx and destination.y == ty then return end
-    end
-
-    table.insert(destinations, ivec2(tx, ty))
-    view:setGateDestinations(unpack(destinations))
-    faction:updateKnownSector(view)
-end
-
-local function updateGateMaps(project)
-    local a = project.endpointA
-    local b = project.endpointB
-
-    local factions = {}
-
-    local player = Player(project.commissioningPlayerIndex)
-    if player then
-        factions[player.index] = player
-        if player.alliance then factions[player.alliance.index] = player.alliance end
-    end
-
-    for _, faction in pairs(factions) do
-        registerGateOnMap(faction, a.x, a.y, b.x, b.y)
-        registerGateOnMap(faction, b.x, b.y, a.x, a.y)
-    end
 end
 
 function GateCommissionHub.finishProject()
@@ -393,13 +289,14 @@ function GateCommissionHub.finishProject()
     local b = project.endpointB
     local playerIndex = project.commissioningPlayerIndex
 
-    -- Cleared up front so a failure below can never leave activation retrying forever.
+    -- Cleared up front so a failure below can never leave deployment retrying forever.
     GateCommissionHub.data.project = nil
 
-    GateConstructionLinks.add(a.x, a.y, b.x, b.y)
-    GateInfluence.onLinkCompleted(a.x, a.y, b.x, b.y)
-    GateDiplomacy.onLinkCompleted(playerIndex)
-    updateGateMaps(project)
+    -- The pair stays reserved so it can't be commissioned twice. The real link, the map
+    -- connection, the influence network and the faction gifts all wait until a player
+    -- activates one of the inactive gates.
+    GateConstructionLinks.addPending(a.x, a.y, b.x, b.y)
+    GateConstructionMap.markInactiveLink({playerIndex}, a.x, a.y, b.x, b.y)
 
     local station = Entity()
     station:setValue("gate_construction_busy", false)
@@ -408,12 +305,12 @@ function GateCommissionHub.finishProject()
     if player then
         -- sendChatMessage substitutes %1%-style placeholders, not ${named} ones.
         player:sendChatMessage(station, ChatMessageType.Normal,
-            "Gate construction complete. The gates linking (%1%:%2%) and (%3%:%4%) are now online."%_T,
+            "Gate construction complete. Inactive gates now stand in (%1%:%2%) and (%3%:%4%). Fly a ship carrying an installed XSTN-K I to either one to bring the link online."%_T,
             a.x, a.y, b.x, b.y)
     end
 end
 
-function GateCommissionHub.updateActivation()
+function GateCommissionHub.updateDeployment()
     local project = getProject()
     if not project then return end
 
@@ -421,11 +318,11 @@ function GateCommissionHub.updateActivation()
     local b = project.endpointB
 
     if not project.spawnedA then
-        project.spawnedA = spawnGateIn(project, a.x, a.y, b.x, b.y)
+        project.spawnedA = spawnInactiveGateIn(project, a.x, a.y, b.x, b.y)
     end
 
     if not project.spawnedB then
-        project.spawnedB = spawnGateIn(project, b.x, b.y, a.x, a.y)
+        project.spawnedB = spawnInactiveGateIn(project, b.x, b.y, a.x, a.y)
     end
 
     if project.spawnedA and project.spawnedB then
@@ -440,8 +337,8 @@ function GateCommissionHub.updateServer(timeStep)
         return
     end
 
-    if project.activating then
-        GateCommissionHub.updateActivation()
+    if project.deploying then
+        GateCommissionHub.updateDeployment()
         return
     end
 
@@ -455,8 +352,8 @@ function GateCommissionHub.updateServer(timeStep)
 
     if project.remaining <= 0 then
         project.remaining = 0
-        project.activating = true
-        GateCommissionHub.updateActivation()
+        project.deploying = true
+        GateCommissionHub.updateDeployment()
     end
 end
 
@@ -476,7 +373,7 @@ function GateCommissionHub.initUI()
 
     local introRect = lister:nextRect(96)
     ui.intro = window:createTextField(introRect,
-        "Commissioning a gate is expensive. This station needs ${m} minutes to bring the new link online, and construction continues even while you are away."%_t % {m = BUILD_TIME_MINUTES})
+        "Commissioning a gate is expensive. This station needs ${m} minutes to build the gates, and construction continues even while you are away. The gates arrive inactive: a ship with an installed XSTN-K I has to switch them on."%_t % {m = BUILD_TIME_MINUTES})
     ui.intro.fontSize = 13
     ui.intro.fontColor = ColorRGB(0.7, 0.7, 0.7)
 
@@ -573,7 +470,7 @@ local function updateStatusLabel()
 
     if ui.busy and ui.project then
         if (ui.remaining or 0) <= 0 then
-            ui.statusLabel.caption = "Bringing the (${ax}:${ay}) <-> (${bx}:${by}) link online..."%_T % ui.project
+            ui.statusLabel.caption = "Deploying inactive gates at (${ax}:${ay}) and (${bx}:${by})..."%_T % ui.project
         else
             ui.statusLabel.caption = "Building (${ax}:${ay}) <-> (${bx}:${by}) - ${m} min remaining"%_T % {
                 ax = ui.project.ax,
@@ -802,7 +699,7 @@ function GateCommissionHub.startCommission(ax, ay, bx, by)
 
     invokeClientFunction(player, "receiveStatus", true, ax, ay, bx, by, BUILD_TIME)
     player:sendChatMessage(station, ChatMessageType.Normal,
-        "Thank you for your purchase. The gates will be constructed in about %1% minutes."%_T,
+        "Thank you for your purchase. The gates will be built in about %1% minutes. They will arrive inactive - a ship with an installed XSTN-K I can switch them on."%_T,
         BUILD_TIME_MINUTES)
 end
 callable(GateCommissionHub, "startCommission")

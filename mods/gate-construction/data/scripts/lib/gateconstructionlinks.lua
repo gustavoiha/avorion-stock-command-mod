@@ -1,9 +1,13 @@
 -- Shared registry of gate links commissioned by the gate-construction mod.
 -- Stored as a server value so it survives restarts and works for unloaded sectors.
+--
+-- Two sets are kept: pending links, whose inactive gates are built but not switched on
+-- yet, and active links, which have real working gates at both endpoints.
 
 local GateConstructionLinks = {}
 
 local VALUE_KEY = "gate_construction_links"
+local PENDING_KEY = "gate_construction_pending_links"
 local VERSION_KEY = "gate_construction_links_version"
 local VERSION = 2
 
@@ -25,10 +29,10 @@ function GateConstructionLinks.key(ax, ay, bx, by)
     return string.format("%i:%i>%i:%i", ax, ay, bx, by)
 end
 
-function GateConstructionLinks.getAll()
+local function load(setKey)
     migrate()
 
-    local raw = Server():getValue(VALUE_KEY) or ""
+    local raw = Server():getValue(setKey) or ""
 
     local links = {}
     for entry in string.gmatch(raw, "[^;]+") do
@@ -38,36 +42,68 @@ function GateConstructionLinks.getAll()
     return links
 end
 
-local function store(links)
+local function store(setKey, links)
     local entries = {}
     for entry, _ in pairs(links) do
         table.insert(entries, entry)
     end
 
     table.sort(entries)
-    Server():setValue(VALUE_KEY, table.concat(entries, ";"))
+    Server():setValue(setKey, table.concat(entries, ";"))
 end
 
-function GateConstructionLinks.exists(ax, ay, bx, by)
-    return GateConstructionLinks.getAll()[GateConstructionLinks.key(ax, ay, bx, by)] == true
+local function exists(setKey, ax, ay, bx, by)
+    return load(setKey)[GateConstructionLinks.key(ax, ay, bx, by)] == true
 end
 
-function GateConstructionLinks.add(ax, ay, bx, by)
-    local links = GateConstructionLinks.getAll()
+local function add(setKey, ax, ay, bx, by)
+    local links = load(setKey)
     local key = GateConstructionLinks.key(ax, ay, bx, by)
     if links[key] then return end
 
     links[key] = true
-    store(links)
+    store(setKey, links)
 end
 
-function GateConstructionLinks.remove(ax, ay, bx, by)
-    local links = GateConstructionLinks.getAll()
+local function remove(setKey, ax, ay, bx, by)
+    local links = load(setKey)
     local key = GateConstructionLinks.key(ax, ay, bx, by)
     if not links[key] then return end
 
     links[key] = nil
-    store(links)
+    store(setKey, links)
+end
+
+function GateConstructionLinks.getAll()
+    return load(VALUE_KEY)
+end
+
+function GateConstructionLinks.exists(ax, ay, bx, by)
+    return exists(VALUE_KEY, ax, ay, bx, by)
+end
+
+function GateConstructionLinks.add(ax, ay, bx, by)
+    add(VALUE_KEY, ax, ay, bx, by)
+end
+
+function GateConstructionLinks.remove(ax, ay, bx, by)
+    remove(VALUE_KEY, ax, ay, bx, by)
+end
+
+function GateConstructionLinks.getAllPending()
+    return load(PENDING_KEY)
+end
+
+function GateConstructionLinks.existsPending(ax, ay, bx, by)
+    return exists(PENDING_KEY, ax, ay, bx, by)
+end
+
+function GateConstructionLinks.addPending(ax, ay, bx, by)
+    add(PENDING_KEY, ax, ay, bx, by)
+end
+
+function GateConstructionLinks.removePending(ax, ay, bx, by)
+    remove(PENDING_KEY, ax, ay, bx, by)
 end
 
 return GateConstructionLinks
