@@ -49,6 +49,14 @@ function ProductionCapacityStats.getRequiredCapacity(optimal)
     return math.ceil(optimal)
 end
 
+function ProductionCapacityStats.getCycleTimeSeconds(optimal, capacity)
+    if not optimal then return nil end
+
+    local effectiveCapacity = math.max(MinimumCapacity, capacity or 0)
+    local cycleTime = math.max(MinimumTimeToProduce, MinimumTimeToProduce * optimal / effectiveCapacity)
+    return math.floor(cycleTime)
+end
+
 
 if onServer() then
 
@@ -81,11 +89,25 @@ end
 
 if onClient() then
 
-local window
-local label
+local titleLabel
+local capacityTitleLabel
+local capacityValueLabel
+local cycleTimeTitleLabel
+local cycleTimeValueLabel
+local container
 local requestedCraft
 local answeredCraft
 local optimalCapacity
+
+local function hideUi()
+    if titleLabel then
+        titleLabel:hide()
+        capacityTitleLabel:hide()
+        capacityValueLabel:hide()
+        cycleTimeTitleLabel:hide()
+        cycleTimeValueLabel:hide()
+    end
+end
 
 function ProductionCapacityStats.getUpdateInterval()
     return 0.5
@@ -95,17 +117,42 @@ function ProductionCapacityStats.initialize()
     Player():registerCallback("onStateChanged", "onStateChanged")
 
     local res = getResolution()
-    local size = vec2(300, 60)
-    local position = vec2(20, res.y - size.y - 20)
+    local hud = Hud()
+    container = hud:createContainer(Rect(vec2(0, 0), res))
 
-    window = Hud():createWindow(Rect(position, position + size))
-    window.caption = "Production Capacity"%_t
-    window.moveable = true
+    local right = res.x - 22
+    local left = res.x - 200
+    local top = res.y - 112
 
-    label = window:createLabel(Rect(vec2(10, 5), size - vec2(10, 10)), "", 15)
-    label:setCenterAligned()
+    titleLabel = container:createLabel(Rect(vec2(left, top), vec2(right, top + 13)), "Production Capacity", 12)
+    titleLabel:setLeftAligned()
+    titleLabel.color = ColorRGB(0.82, 0.82, 0.82)
+    titleLabel.outline = true
+    titleLabel:hide()
 
-    window:hide()
+    capacityTitleLabel = container:createLabel(Rect(vec2(left, top + 18), vec2(right - 48, top + 31)), "Capacity", 12)
+    capacityTitleLabel:setLeftAligned()
+    capacityTitleLabel.color = ColorRGB(0.72, 0.72, 0.72)
+    capacityTitleLabel.outline = true
+    capacityTitleLabel:hide()
+
+    capacityValueLabel = container:createLabel(Rect(vec2(right - 100, top + 18), vec2(right, top + 31)), "", 12)
+    capacityValueLabel:setRightAligned()
+    capacityValueLabel.outline = true
+    capacityValueLabel:hide()
+
+    cycleTimeTitleLabel = container:createLabel(Rect(vec2(left, top + 32), vec2(right - 48, top + 45)), "Cycle Time", 12)
+    cycleTimeTitleLabel:setLeftAligned()
+    cycleTimeTitleLabel.color = ColorRGB(0.72, 0.72, 0.72)
+    cycleTimeTitleLabel.outline = true
+    cycleTimeTitleLabel:hide()
+
+    cycleTimeValueLabel = container:createLabel(Rect(vec2(right - 100, top + 32), vec2(right, top + 45)), "", 12)
+    cycleTimeValueLabel:setRightAligned()
+    cycleTimeValueLabel.outline = true
+    cycleTimeValueLabel:hide()
+
+    hideUi()
 end
 
 function ProductionCapacityStats.onStateChanged(newState, oldState)
@@ -115,7 +162,7 @@ function ProductionCapacityStats.onStateChanged(newState, oldState)
     optimalCapacity = nil
 
     if newState ~= PlayerStateType.BuildCraft then
-        window:hide()
+        hideUi()
     end
 end
 
@@ -128,13 +175,13 @@ function ProductionCapacityStats.updateClient()
     local player = Player()
 
     if player.state ~= PlayerStateType.BuildCraft then
-        window:hide()
+        hideUi()
         return
     end
 
     local craft = player.craft
     if not valid(craft) then
-        window:hide()
+        hideUi()
         return
     end
 
@@ -148,21 +195,31 @@ function ProductionCapacityStats.updateClient()
 
     -- no answer yet, or the craft doesn't produce goods: leave the vanilla stats alone
     if answeredCraft ~= craftId or not optimalCapacity then
-        window:hide()
+        hideUi()
         return
     end
 
     local current = math.floor(Plan(craft):getStats().productionCapacity)
     local required = ProductionCapacityStats.getRequiredCapacity(optimalCapacity)
+    local cycleTime = ProductionCapacityStats.getCycleTimeSeconds(optimalCapacity, current)
 
-    label.caption = string.format("%i/%i", current, required)
+    titleLabel.caption = "Production Capacity"%_t
+    titleLabel:show()
+    capacityTitleLabel.caption = "Capacity"%_t
+    capacityTitleLabel:show()
+    capacityValueLabel.caption = string.format("%i/%i", current, required)
+    capacityValueLabel:show()
     if current >= required then
-        label.color = ColorRGB(0.6, 1.0, 0.6)
+        capacityValueLabel.color = ColorRGB(0.6, 1.0, 0.6)
     else
-        label.color = ColorRGB(1.0, 0.5, 0.5)
+        capacityValueLabel.color = ColorRGB(1.0, 0.5, 0.5)
     end
 
-    window:show()
+    cycleTimeTitleLabel.caption = "Cycle Time"%_t
+    cycleTimeTitleLabel:show()
+    cycleTimeValueLabel.caption = string.format("%is", cycleTime)
+    cycleTimeValueLabel.color = ColorRGB(0.8, 0.8, 0.8)
+    cycleTimeValueLabel:show()
 end
 
 end

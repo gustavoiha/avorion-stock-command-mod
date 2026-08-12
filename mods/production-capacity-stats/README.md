@@ -1,20 +1,25 @@
 # Optimal Production Capacity Stats
 
 While you are in build mode on a station that produces goods (factories and
-mines), this mod shows a small `have/need` readout for production capacity, in
-the same style the game uses for crew quarters:
+mines), this mod adds a small toggle button in the bottom-left corner. Open it
+to see a compact overlay with both the production capacity readout and the
+estimated production cycle time:
 
 ```
 Production Capacity
-      420/380
+   Capacity 420/380
+      Cycle 15s
 ```
 
-- **Left number**: the production capacity your assembly blocks currently provide.
-- **Right number**: the capacity you still have to build to reach the shortest
+- **Capacity left number**: the production capacity your assembly blocks currently provide.
+- **Capacity right number**: the capacity you still have to build to reach the shortest
   possible production cycle.
+- **Cycle**: the estimated resulting production cycle time in whole seconds,
+  truncated after applying the game's minimum 15 second floor.
 
-Stations that don't produce goods never show the readout, so the default build
-stats are unaffected.
+The overlay starts closed each time you enter build mode. Stations that don't
+produce goods never show the toggle or overlay, so the default build stats are
+unaffected.
 
 ## How the requirement is calculated
 

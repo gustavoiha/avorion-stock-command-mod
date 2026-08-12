@@ -100,6 +100,10 @@ check("empty production", ProductionCapacityStats.getOptimalCapacity({results = 
 check("exactly at the baseline", ProductionCapacityStats.getRequiredCapacity(100), 0)
 check("just above the baseline", ProductionCapacityStats.getRequiredCapacity(100.5), 101)
 
+check("cycle time uses the free baseline", ProductionCapacityStats.getCycleTimeSeconds(134, 40), 20)
+check("cycle time is capped at the minimum", ProductionCapacityStats.getCycleTimeSeconds(134, 200), 15)
+check("cycle time truncates instead of rounding", ProductionCapacityStats.getCycleTimeSeconds(110, 101), 16)
+
 if failures > 0 then
     print(string.format("\n%d test(s) failed", failures))
     os.exit(1)
