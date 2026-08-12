@@ -29,6 +29,13 @@ function GateConstructionLinks.key(ax, ay, bx, by)
     return string.format("%i:%i>%i:%i", ax, ay, bx, by)
 end
 
+function GateConstructionLinks.parse(key)
+    local ax, ay, bx, by = string.match(key, "^(-?%d+):(-?%d+)>(-?%d+):(-?%d+)$")
+    if not ax then return nil end
+
+    return tonumber(ax), tonumber(ay), tonumber(bx), tonumber(by)
+end
+
 local function load(setKey)
     migrate()
 
@@ -76,6 +83,21 @@ end
 
 function GateConstructionLinks.getAll()
     return load(VALUE_KEY)
+end
+
+-- Both endpoints of every active link, as {x = , y = } entries.
+function GateConstructionLinks.getAllSectors()
+    local sectors = {}
+
+    for entry, _ in pairs(load(VALUE_KEY)) do
+        local ax, ay, bx, by = GateConstructionLinks.parse(entry)
+        if ax then
+            table.insert(sectors, {x = ax, y = ay})
+            table.insert(sectors, {x = bx, y = by})
+        end
+    end
+
+    return sectors
 end
 
 function GateConstructionLinks.exists(ax, ay, bx, by)

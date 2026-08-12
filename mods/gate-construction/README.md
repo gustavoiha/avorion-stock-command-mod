@@ -15,7 +15,8 @@ Gate commissioning mod for Avorion.
   - The timer keeps running while you are away; elapsed time is applied when sector `0:0` reloads.
   - When it completes, an **inactive gate** spawns at each endpoint, in the same place and with
     the same look as the finished gate. Nothing can travel through it.
-  - Endpoint sectors are marked `Inactive gate` on the galaxy map.
+  - Endpoint sectors are marked on the galaxy map with a gate icon and a line between them,
+    drawn as a client-side overlay that disappears once the link goes live.
 - Activation:
   - Fly to either inactive gate and interact with it.
   - The ship you are flying must have an installed `XSTN-K I`.

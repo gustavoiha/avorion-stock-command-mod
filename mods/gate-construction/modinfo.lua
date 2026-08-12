@@ -13,7 +13,7 @@ meta =
         .. "installed XSTN-K I has to activate them before the link goes live.",
 
     authors = {"Gugs_Iha"},
-    version = "1.5",
+    version = "1.6",
 
     dependencies = {
     },
