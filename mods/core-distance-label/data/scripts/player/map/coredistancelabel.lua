@@ -44,8 +44,8 @@ function CoreDistanceLabel.refresh(x, y)
         return
     end
 
-    local text = "Sector %i:%i - %.1f sectors from the galactic core"%_t
-    label.caption = string.format(text, x, y, math.sqrt(x * x + y * y))
+    local text = "Distance to center of galaxy: %.1f"%_t
+    label.caption = string.format(text, math.sqrt(x * x + y * y))
     label:show()
 end
 
