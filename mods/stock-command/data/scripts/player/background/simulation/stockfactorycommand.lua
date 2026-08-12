@@ -18,6 +18,9 @@ StockFactoryCommand.type = CommandType.StockFactory
 -- how many goods can be shown in the config checklist
 local MaxGoodCheckboxes = 20
 
+-- anchor-sector operating radius over the gate network
+local MaxGateJumps = 3
+
 -- suppliers are reached purely through the gate network; cycle time is modelled
 -- per gate jump between the target and the supplier, plus a fixed docking overhead
 local SecondsPerGateJump = 45
@@ -53,6 +56,12 @@ local function goodDisplayName(name, amount)
         if ok and result and result ~= "" then return result end
     end
     return name
+end
+
+local function areaAnchor(area)
+    if area and area.lower then
+        return area.lower.x, area.lower.y
+    end
 end
 
 
@@ -91,34 +100,32 @@ end
 ---------------------------------------------------------------------
 
 function StockFactoryCommand:initialize()
-    if not self.config or not self.config.target then
-        return "We need a station to stock."%_T
-    end
-
     if not self.config.goods or #self.config.goods == 0 then
         return "We need at least one good to stock."%_T
+    end
+
+    local ax = areaAnchor(self.area)
+    if not ax then
+        return "We need an anchor sector."%_T
     end
 end
 
 function StockFactoryCommand:onStart()
-    local owner = getParentFaction()
-
-    local target = ShipDatabaseEntry(owner.index, self.config.target)
-    if not valid(target) or target:getEntityType() ~= EntityType.Station then
-        return "The station we were supposed to stock doesn't exist any more."%_T
-    end
-
-    local tx, ty = target:getCoordinates()
-    self.data.target = {name = self.config.target, x = tx, y = ty}
-
     -- cache the station list + reachable region + gate route that were computed
     -- during the area analysis, so the ferry logic has them available (all saved
     -- to the database)
     local analysis = self.area and self.area.analysis or {}
+    local ax, ay = areaAnchor(self.area)
+    if (not ax) and analysis.anchor then
+        ax, ay = analysis.anchor.x, analysis.anchor.y
+    end
+    self.data.anchor = {x = ax, y = ay}
+
     self.data.stations = analysis.stations or {}
     self.data.reachable = analysis.reachable or {}
     self.data.gateCameFrom = analysis.gateCameFrom or {}
     self.data.gateDepth = analysis.gateDepth or {}
+    self.data.callingPlayer = analysis.callingPlayer
 
     self.data.phase = "idle"
     self.data.timer = 0
@@ -127,8 +134,9 @@ function StockFactoryCommand:onStart()
     self.data.sourceCursor = 0
     self.data.remapCooldown = RemapInterval
 
+    local owner = getParentFaction()
     local entry = ShipDatabaseEntry(owner.index, self.shipName)
-    entry:setStatusMessage("Stocking a station"%_T)
+    entry:setStatusMessage("Stocking a sector"%_T)
 end
 
 function StockFactoryCommand:update(timeStep)
@@ -205,29 +213,28 @@ end
 -- ferry planning
 ---------------------------------------------------------------------
 
--- returns the trade script the target station uses to buy the given good
-function StockFactoryCommand:targetScriptFor(good)
-    for _, st in pairs(self.data.stations or {}) do
-        if st.name == self.data.target.name then
-            return st.buys and st.buys[good]
-        end
-    end
-end
-
--- returns the list of owned stations that can supply the given good:
---  - connected to the target through the gate network (no empty-space jumps)
---  - in a DIFFERENT sector than the target (no point stocking from the same sector)
---  - they SELL the good
---  - they do NOT also buy the good (prevents loops / stealing from other factories)
-function StockFactoryCommand:eligibleSources(good)
-    local target = self.data.target
-    local reachable = self.data.reachable or {}
+-- stations in the anchor region that consume the good
+function StockFactoryCommand:eligibleTargets(good)
     local result = {}
 
     for _, st in pairs(self.data.stations or {}) do
-        if st.name ~= target.name
-            and not (st.x == target.x and st.y == target.y)
-            and reachable[skey(st.x, st.y)]
+        if st.buys and st.buys[good] then
+            table.insert(result, st)
+        end
+    end
+
+    return result
+end
+
+-- stations in the anchor region that can supply the good for a target:
+--  - different station than the consumer
+--  - sell the good
+--  - do not also buy the same good (prevents internal starvation/loops)
+function StockFactoryCommand:eligibleSources(good, target)
+    local result = {}
+
+    for _, st in pairs(self.data.stations or {}) do
+        if not (st.name == target.name and st.factionIndex == target.factionIndex)
             and st.sells and st.sells[good]
             and not (st.buys and st.buys[good]) then
             table.insert(result, st)
@@ -240,23 +247,15 @@ end
 -- travel time for one leg of the haul, modelled from the number of gate jumps
 -- between the target and the supplier (recorded during the reachable-region BFS)
 -- plus a fixed docking overhead. Distance through empty space is irrelevant here.
-function StockFactoryCommand:estimateTravelTime(source)
+function StockFactoryCommand:estimateTravelTime(source, target)
     local depthMap = self.data.gateDepth or {}
-    local jumps = math.max(1, depthMap[skey(source.x, source.y)] or 1)
+    local sourceJumps = depthMap[skey(source.x, source.y)] or MaxGateJumps
+    local targetJumps = depthMap[skey(target.x, target.y)] or MaxGateJumps
+    local jumps = math.max(1, sourceJumps + targetJumps)
     return jumps * SecondsPerGateJump + DockingSeconds
 end
 
 function StockFactoryCommand:planNextHaul()
-    local owner = getParentFaction()
-    local target = self.data.target
-
-    -- make sure the target still exists
-    local targetEntry = ShipDatabaseEntry(owner.index, target.name)
-    if not valid(targetEntry) or targetEntry:getEntityType() ~= EntityType.Station then
-        self:setRuntimeError("Commander, the station '%s' we were stocking is gone. Ending the command."%_T, target.name)
-        return
-    end
-
     local goodsList = self.config.goods or {}
     if #goodsList == 0 then
         self.data.phase = "idle"
@@ -273,31 +272,49 @@ function StockFactoryCommand:planNextHaul()
         local good = goodsList[gi]
 
         if isGoodEligible(good) then
-            local sources = self:eligibleSources(good)
+            local targets = self:eligibleTargets(good)
 
-            if #sources > 0 then
-                -- rotate through the possible sources too
-                local sIdx = ((self.data.sourceCursor or 0) % #sources) + 1
-                local source = sources[sIdx]
+            if #targets > 0 then
+                local tStart = self.data.targetCursor or 0
 
-                self.data.cursor = cursor + attempt + 1
-                self.data.sourceCursor = (self.data.sourceCursor or 0) + 1
+                for tAttempt = 0, #targets - 1 do
+                    local ti = ((tStart + tAttempt) % #targets) + 1
+                    local target = targets[ti]
+                    local sources = self:eligibleSources(good, target)
 
-                self.data.currentHaul = {
-                    good = good,
-                    source = {
-                        name = source.name,
-                        x = source.x,
-                        y = source.y,
-                        script = source.sells[good],
-                    },
-                    targetScript = self:targetScriptFor(good),
-                    travelTime = self:estimateTravelTime(source),
-                }
+                    if #sources > 0 then
+                        -- rotate through the possible sources too
+                        local sIdx = ((self.data.sourceCursor or 0) % #sources) + 1
+                        local source = sources[sIdx]
 
-                self.data.phase = "hauling"
-                self.data.timer = 0
-                return
+                        self.data.cursor = cursor + attempt + 1
+                        self.data.targetCursor = tStart + tAttempt + 1
+                        self.data.sourceCursor = (self.data.sourceCursor or 0) + 1
+
+                        self.data.currentHaul = {
+                            good = good,
+                            source = {
+                                name = source.name,
+                                factionIndex = source.factionIndex,
+                                x = source.x,
+                                y = source.y,
+                                script = source.sells[good],
+                            },
+                            target = {
+                                name = target.name,
+                                factionIndex = target.factionIndex,
+                                x = target.x,
+                                y = target.y,
+                                script = target.buys[good],
+                            },
+                            travelTime = self:estimateTravelTime(source, target),
+                        }
+
+                        self.data.phase = "hauling"
+                        self.data.timer = 0
+                        return
+                    end
+                end
             end
         end
     end
@@ -317,11 +334,11 @@ package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 include("stringutility")
 
-function run(faction, shipName, stationName, script, goodName, callback)
+function run(faction, shipName, stationFaction, stationName, script, goodName, callback)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end -- command will be cancelled anyway
 
-    local station = Sector():getEntityByFactionAndName(faction, stationName)
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then
         invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
         return
@@ -342,11 +359,11 @@ package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 include("stringutility")
 
-function run(faction, shipName, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end
 
-    local station = Sector():getEntityByFactionAndName(faction, stationName)
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then
         invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
         return
@@ -368,11 +385,11 @@ include("goods")
 include("utility")
 include("stringutility")
 
-function run(faction, shipName, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end
 
-    local station = Sector():getEntityByFactionAndName(faction, stationName)
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then
         invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
         return
@@ -397,11 +414,11 @@ package.path = package.path .. ";data/scripts/lib/?.lua"
 include("goods")
 include("utility")
 
-function run(faction, shipName, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end
 
-    local station = Sector():getEntityByFactionAndName(faction, stationName)
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then return end
 
     local good = goods[goodName]
@@ -412,8 +429,10 @@ end
 ]]
 
 function StockFactoryCommand:querySectors()
-    local t = self.data.target
-    local s = self.data.currentHaul.source
+    local haul = self.data.currentHaul
+    local t = haul and haul.target
+    local s = haul and haul.source
+    if not t or not s then return false end
 
     Galaxy():keepOrGetSector(t.x, t.y, 90)
     Galaxy():keepOrGetSector(s.x, s.y, 90)
@@ -428,10 +447,10 @@ end
 function StockFactoryCommand:beginTransaction()
     local haul = self.data.currentHaul
     local owner = getParentFaction()
-    local t = self.data.target
+    local t = haul.target
     local s = haul.source
 
-    if not haul.targetScript or not s.script then
+    if not t.script or not s.script then
         -- we don't know which scripts trade the good; skip this haul
         self.data.currentHaul = nil
         self.data.phase = "idle"
@@ -461,8 +480,8 @@ function StockFactoryCommand:beginTransaction()
         sourceStock = 0,
     }
 
-    runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.name, haul.targetScript, haul.good, "reportTargetStock")
-    runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.name, s.script, haul.good, "reportSourceStock")
+    runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock")
+    runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock")
 
     self.data.phase = "transacting"
     self.data.timer = 0
@@ -515,7 +534,7 @@ function StockFactoryCommand:tryExecuteHaul()
         return
     end
 
-    runSectorCode(haul.source.x, haul.source.y, true, removeCode, "run", owner.index, self.shipName, haul.source.name, good, amount)
+    runSectorCode(haul.source.x, haul.source.y, true, removeCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, amount)
 end
 
 function StockFactoryCommand:onGoodsRemoved(good, removed)
@@ -530,8 +549,8 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
         return
     end
 
-    local t = self.data.target
-    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.name, good, removed)
+    local t = haul.target
+    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, good, removed)
 end
 
 function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
@@ -541,7 +560,7 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     -- if the target had less room than expected (e.g. another ship delivered in
     -- the meantime), return the leftover goods to the source instead of losing them
     if haul and (notAdded or 0) > 0 then
-        runSectorCode(haul.source.x, haul.source.y, true, retourCode, "run", owner.index, self.shipName, haul.source.name, good, notAdded)
+        runSectorCode(haul.source.x, haul.source.y, true, retourCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, notAdded)
     end
 
     local returnLeg = (haul and haul.travelTime) or 60
@@ -575,14 +594,9 @@ end
 function StockFactoryCommand:onAreaAnalysisSector(results, meta, x, y)
 end
 
--- BFS over the gate network from the origin sector, following the gate graph as
--- far as it reaches. Suppliers are only reachable through gates -- empty-space
--- jumps are NOT considered. Returns the reachable set, a gate-predecessor map
--- (cameFrom[sectorKey] = the sector one gate hop closer to the origin) used to
--- retrace the exact gate route, and a gate-depth map (depth[sectorKey] = number
--- of gate jumps from the origin) used to model cycle time. Gate hops into sectors
--- controlled by a faction we're at war with are skipped, so a gate turning hostile
--- cuts that branch off the route.
+-- BFS over the gate network from the anchor sector, bounded to MaxGateJumps.
+-- Returns the reachable set, a gate-predecessor map (cameFrom[key] points one hop
+-- closer to the anchor), and gate depths.
 local function computeReachableRegion(owner, originX, originY)
     local reachable = {}
     local cameFrom = {}
@@ -597,20 +611,10 @@ local function computeReachableRegion(owner, originX, originY)
         end
     end
 
-    local function sectorBlocked(x, y)
-        if not owner then return false end
-        local faction = Galaxy():getControllingFaction(x, y)
-        if not faction or faction.index == owner.index then return false end
-        local ok, status = pcall(function() return owner:getRelationStatus(faction.index) end)
-        return ok and status == RelationStatus.War
-    end
-
-    -- the origin (target) sector itself is part of the operating region
+    -- the anchor sector itself is part of the operating region
     add(originX, originY)
 
-    -- unbounded gate flood fill. Follows the gate graph outward from the origin,
-    -- recording how many gate jumps each sector is away, until it is fully
-    -- explored (or the safety cap is hit).
+    -- bounded gate flood fill up to MaxGateJumps.
     local ok, gatesMap = pcall(function() return GatesMap(Server().seed) end)
     if ok and gatesMap then
         local originKey = skey(originX, originY)
@@ -619,7 +623,7 @@ local function computeReachableRegion(owner, originX, originY)
         local frontier = {{x = originX, y = originY}}
         local depth = 0
 
-        while #frontier > 0 do
+        while #frontier > 0 and depth < MaxGateJumps do
             depth = depth + 1
             local nextFrontier = {}
 
@@ -632,14 +636,12 @@ local function computeReachableRegion(owner, originX, originY)
                     local key = skey(coord.x, coord.y)
                     if not gateVisited[key] then
                         gateVisited[key] = true
-                        if not sectorBlocked(coord.x, coord.y) then
-                            cameFrom[key] = {x = sector.x, y = sector.y}
-                            gateDepth[key] = depth
-                            add(coord.x, coord.y)
-                            table.insert(nextFrontier, coord)
-                            if count >= MaxReachableSectors then
-                                return reachable, cameFrom, gateDepth
-                            end
+                        cameFrom[key] = {x = sector.x, y = sector.y}
+                        gateDepth[key] = depth
+                        add(coord.x, coord.y)
+                        table.insert(nextFrontier, coord)
+                        if count >= MaxReachableSectors then
+                            return reachable, cameFrom, gateDepth
                         end
                     end
                 end
@@ -653,55 +655,89 @@ local function computeReachableRegion(owner, originX, originY)
 end
 
 -- gathers the owner's stations that trade goods, with their buy/sell trade scripts
-local function gatherOwnedTradingStations(owner)
+local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
     local tradeScripts = TradingUtility.getTradeableScripts()
     local stations = {}
+    local seenStations = {}
 
-    for _, name in pairs({owner:getShipNames()}) do
-        local entry = ShipDatabaseEntry(owner.index, name)
+    local factions = {}
+    local factionSeen = {}
 
-        if valid(entry) and entry:getEntityType() == EntityType.Station then
-            local scripts = entry:getScripts()
-            local secured = entry:getSecuredScriptValues()
+    local function addFaction(faction)
+        if not faction or factionSeen[faction.index] then return end
+        factionSeen[faction.index] = true
+        table.insert(factions, faction)
+    end
 
-            local buys = {}
-            local sells = {}
-            local hasTrade = false
+    addFaction(owner)
 
-            for i, script in pairs(scripts) do
-                local isTrade = false
-                for _, tradeScript in pairs(tradeScripts) do
-                    if string.ends(script, tradeScript) then
-                        isTrade = true
-                        break
-                    end
-                end
+    if owner and owner.isPlayer then
+        local player = Player(owner.index)
+        if player and player.allianceIndex and player.allianceIndex ~= 0 then
+            addFaction(Alliance(player.allianceIndex))
+        end
+    elseif owner and owner.isAlliance and callingPlayer then
+        local player = Player(callingPlayer)
+        if player then addFaction(player) end
+    end
 
-                if isTrade then
-                    local values = secured[i] or {}
+    for _, faction in pairs(factions) do
+        for _, name in pairs({faction:getShipNames()}) do
+            local stationKey = faction.index .. ":" .. name
+            if seenStations[stationKey] then goto continue end
 
-                    local soldGoods = values.soldGoods
-                    if not soldGoods and values.tradingData then soldGoods = values.tradingData.soldGoods end
+            local entry = ShipDatabaseEntry(faction.index, name)
 
-                    local boughtGoods = values.boughtGoods
-                    if not boughtGoods and values.tradingData then boughtGoods = values.tradingData.boughtGoods end
-
-                    for _, good in pairs(soldGoods or {}) do
-                        sells[good.name] = script
-                        hasTrade = true
-                    end
-
-                    for _, good in pairs(boughtGoods or {}) do
-                        buys[good.name] = script
-                        hasTrade = true
-                    end
-                end
-            end
-
-            if hasTrade then
+            if valid(entry) and entry:getEntityType() == EntityType.Station then
                 local x, y = entry:getCoordinates()
-                table.insert(stations, {name = name, x = x, y = y, buys = buys, sells = sells})
+                if reachable and not reachable[skey(x, y)] then
+                    goto continue
+                end
+
+                local scripts = entry:getScripts()
+                local secured = entry:getSecuredScriptValues()
+
+                local buys = {}
+                local sells = {}
+                local hasTrade = false
+
+                for i, script in pairs(scripts) do
+                    local isTrade = false
+                    for _, tradeScript in pairs(tradeScripts) do
+                        if string.ends(script, tradeScript) then
+                            isTrade = true
+                            break
+                        end
+                    end
+
+                    if isTrade then
+                        local values = secured[i] or {}
+
+                        local soldGoods = values.soldGoods
+                        if not soldGoods and values.tradingData then soldGoods = values.tradingData.soldGoods end
+
+                        local boughtGoods = values.boughtGoods
+                        if not boughtGoods and values.tradingData then boughtGoods = values.tradingData.boughtGoods end
+
+                        for _, good in pairs(soldGoods or {}) do
+                            sells[good.name] = script
+                            hasTrade = true
+                        end
+
+                        for _, good in pairs(boughtGoods or {}) do
+                            buys[good.name] = script
+                            hasTrade = true
+                        end
+                    end
+                end
+
+                if hasTrade then
+                    seenStations[stationKey] = true
+                    table.insert(stations, {name = name, factionIndex = faction.index, x = x, y = y, buys = buys, sells = sells})
+                end
             end
+
+            ::continue::
         end
     end
 
@@ -710,16 +746,19 @@ end
 
 function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
     local owner = Galaxy():findFaction(meta.factionIndex)
+    local ax, ay = areaAnchor(meta.area)
+    if not ax then
+        ax, ay = meta.faction:getShipPosition(meta.shipName)
+    end
 
-    results.stations = gatherOwnedTradingStations(owner)
-
-    -- reachable region around the ship's sector (which is also the target's sector,
-    -- since only stations in the ship's sector can be selected as target)
-    local sx, sy = meta.faction:getShipPosition(meta.shipName)
-    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, sx, sy)
+    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, ax, ay)
     results.reachable = reachable
     results.gateCameFrom = gateCameFrom
     results.gateDepth = gateDepth
+    results.anchor = {x = ax, y = ay}
+    results.callingPlayer = meta.callingPlayer
+
+    results.stations = gatherOwnedTradingStations(owner, reachable, meta.callingPlayer)
 
     -- let the appearance system show the ferry anywhere in its operating region.
     -- each entry is flagged `hidden = true` so the vanilla map highlighter
@@ -751,8 +790,12 @@ end
 -- supplier (i.e. the command can still do its job at all)
 function StockFactoryCommand:hasAnyReachableSource()
     for _, good in pairs(self.config.goods or {}) do
-        if isGoodEligible(good) and #self:eligibleSources(good) > 0 then
-            return true
+        if isGoodEligible(good) then
+            for _, target in pairs(self:eligibleTargets(good)) do
+                if #self:eligibleSources(good, target) > 0 then
+                    return true
+                end
+            end
         end
     end
     return false
@@ -764,28 +807,27 @@ end
 -- keep the order, so it is stopped and recalled.
 function StockFactoryCommand:remapRoute()
     local owner = getParentFaction()
-    local target = self.data.target
-    if not owner or not target then return end
+    local anchor = self.data.anchor
+    if not owner or not anchor then return end
 
-    local targetEntry = ShipDatabaseEntry(owner.index, target.name)
-    if not valid(targetEntry) or targetEntry:getEntityType() ~= EntityType.Station then
-        self:setRuntimeError("Commander, the station '%s' we were stocking is gone. Recalling."%_T, target.name)
-        return
+    if not anchor.x then
+        local ship = ShipDatabaseEntry(owner.index, self.shipName)
+        if valid(ship) then
+            local sx, sy = ship:getCoordinates()
+            anchor.x, anchor.y = sx, sy
+        else
+            return
+        end
     end
 
-    local tx, ty = targetEntry:getCoordinates()
-    self.data.target.x = tx
-    self.data.target.y = ty
-
-    self.data.stations = gatherOwnedTradingStations(owner)
-
-    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, tx, ty)
+    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, anchor.x, anchor.y)
     self.data.reachable = reachable
     self.data.gateCameFrom = gateCameFrom
     self.data.gateDepth = gateDepth
+    self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
 
     if not self:hasAnyReachableSource() then
-        self:setRuntimeError("Commander, we can no longer reach a supplier for '%s' -- the route is cut off or the suppliers are gone. Recalling."%_T, target.name)
+        self:setRuntimeError("Commander, there are no producer/consumer station pairs for the selected goods in the anchor region. Recalling."%_T)
     end
 end
 
@@ -808,68 +850,66 @@ function run(faction, shipName, nextX, nextY, useGate)
 end
 ]]
 
--- walk the saved gate-predecessor map from a source back towards the target; the
--- node whose predecessor IS the target is the first gate hop out of the target
-local function firstGateHopFromTarget(cameFrom, targetKey, sx, sy)
-    local node = {x = sx, y = sy}
-    local nodeKey = skey(sx, sy)
+-- next gate hop from one sector to another using the saved anchor-rooted BFS tree.
+local function nextHopOnTree(cameFrom, anchorX, anchorY, fromX, fromY, toX, toY)
+    if fromX == toX and fromY == toY then return nil, nil, false end
 
-    -- bounded by the reachable-region safety cap so a corrupt map can't loop forever
+    local fromKey = skey(fromX, fromY)
+    local ancestors = {}
+    local cx, cy = fromX, fromY
+
     for _ = 1, MaxReachableSectors do
-        local pred = cameFrom[nodeKey]
-        if not pred then return nil end
-        if skey(pred.x, pred.y) == targetKey then
-            return node
-        end
-        node = pred
-        nodeKey = skey(pred.x, pred.y)
+        local key = skey(cx, cy)
+        ancestors[key] = true
+        if cx == anchorX and cy == anchorY then break end
+        local pred = cameFrom[key]
+        if not pred then break end
+        cx, cy = pred.x, pred.y
     end
 
-    return nil
-end
-
--- a gate-reachable supplier (for a selected good) the ferry can head to from the target
-function StockFactoryCommand:pickGateReachableSource()
-    local cameFrom = self.data.gateCameFrom or {}
-
-    for _, good in pairs(self.config.goods or {}) do
-        if isGoodEligible(good) then
-            for _, st in pairs(self:eligibleSources(good)) do
-                if cameFrom[skey(st.x, st.y)] then
-                    return st
-                end
+    local tx, ty = toX, toY
+    local child
+    for _ = 1, MaxReachableSectors do
+        local key = skey(tx, ty)
+        if ancestors[key] then
+            if key == fromKey and child then
+                return child.x, child.y, true
             end
+
+            local up = cameFrom[fromKey]
+            if up then return up.x, up.y, true end
+            return nil, nil, false
         end
+
+        local pred = cameFrom[key]
+        if not pred then break end
+        child = {x = tx, y = ty}
+        tx, ty = pred.x, pred.y
     end
+
+    local up = cameFrom[fromKey]
+    if up then return up.x, up.y, true end
+    return nil, nil, false
 end
 
 -- given the sector a ferry is in, return the next sector it should head towards
 -- (one gate hop) and whether that hop uses a gate. Hub-and-spoke loop:
 -- target -> supplier -> target -> ...
 function StockFactoryCommand:computeFerryNextHop(sx, sy)
-    local target = self.data.target
-    if not target then return nil, nil, false end
+    local haul = self.data.currentHaul
+    if not haul or not haul.source or not haul.target then return nil, nil, false end
 
     local cameFrom = self.data.gateCameFrom or {}
-    local targetKey = skey(target.x, target.y)
-    local currentKey = skey(sx, sy)
+    local anchor = self.data.anchor or {}
+    local destX, destY
 
-    if currentKey == targetKey then
-        -- sitting at the target: leave towards a gate-reachable supplier
-        local source = self:pickGateReachableSource()
-        if not source then return nil, nil, false end
-
-        local hop = firstGateHopFromTarget(cameFrom, targetKey, source.x, source.y)
-        if hop then return hop.x, hop.y, true end
-        return nil, nil, false
+    if sx == haul.target.x and sy == haul.target.y then
+        destX, destY = haul.source.x, haul.source.y
+    else
+        destX, destY = haul.target.x, haul.target.y
     end
 
-    -- sitting at a supplier (or anywhere gate-reachable): head back towards the
-    -- target, one gate hop at a time
-    local pred = cameFrom[currentKey]
-    if pred then return pred.x, pred.y, true end
-
-    return nil, nil, false
+    return nextHopOnTree(cameFrom, anchor.x, anchor.y, sx, sy, destX, destY)
 end
 
 -- invoked by the ferry appearance to learn which gate to use; replies straight
@@ -890,12 +930,16 @@ end
 ---------------------------------------------------------------------
 
 function StockFactoryCommand:getDescriptionText()
-    local station = (self.data and self.data.target and self.data.target.name) or self.config.target or ""
-    return "The ship is keeping the station '${station}' stocked, ferrying the goods it needs from your own nearby stations."%_T, {station = station}
+    local anchor = self.data and self.data.anchor
+    if anchor then
+        return "The ship is stocking your stations in the anchor region around \\s(${x}:${y}), moving selected goods between your own producers and consumers."%_T, {x = anchor.x, y = anchor.y}
+    end
+
+    return "The ship is stocking your stations in the anchor region, moving selected goods between your own producers and consumers."%_T
 end
 
 function StockFactoryCommand:getStatusMessage()
-    return "Stocking a station /* ship AI status */"%_T
+    return "Stocking a sector /* ship AI status */"%_T
 end
 
 function StockFactoryCommand:getIcon()
@@ -910,29 +954,21 @@ function StockFactoryCommand:getRecallError()
 end
 
 function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
-    if not config or not config.target then
-        return "You haven't picked a station for me to keep stocked. Select one of your stations in this sector first."%_t
-    end
-
     if not config.goods or #config.goods == 0 then
-        return "You haven't selected any goods for me to stock. Tick at least one of the goods the station needs before I can start."%_t
+        return "You haven't selected any goods for me to stock. Tick at least one good from your anchor region before I can start."%_t
     end
 
     local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
 
-    if not prediction.hasTarget then
-        return "The selected station couldn't be found."%_t
-    end
-
     if prediction.numGoodsWithSource == 0 then
-        return "None of your stations in range supply the selected goods without also buying them."%_t
+        return "No producer/consumer station pairs for the selected goods were found in the anchor region (up to 3 gate jumps)."%_t
     end
 
     return
 end
 
 function StockFactoryCommand:getAreaSize(ownerIndex, shipName)
-    return {x = 1, y = 1} -- the target is in the ship's own sector
+    return {x = 1, y = 1} -- one selected anchor sector
 end
 
 function StockFactoryCommand:isShipRequiredInArea(ownerIndex, shipName)
@@ -940,11 +976,11 @@ function StockFactoryCommand:isShipRequiredInArea(ownerIndex, shipName)
 end
 
 function StockFactoryCommand:isAreaFixed(ownerIndex, shipName)
-    return true
+    return false
 end
 
 function StockFactoryCommand:getAreaSelectionTooltip(ownerIndex, shipName, area, valid)
-    return ""
+    return "Left-Click to select the anchor sector"%_t
 end
 
 function StockFactoryCommand:getConfigurableValues(ownerIndex, shipName)
@@ -967,34 +1003,27 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
 
     local analysis = area.analysis or {}
     local stations = analysis.stations or {}
-    local reachable = analysis.reachable or {}
-
-    local target
-    for _, st in pairs(stations) do
-        if st.name == config.target then
-            target = st
-            break
-        end
-    end
-
-    prediction.hasTarget = target ~= nil
 
     local supplierCount = 0
     local goodsWithSource = {}
 
-    if target and config.goods then
+    if config.goods then
         for _, good in pairs(config.goods) do
             if isGoodEligible(good) then
-                for _, st in pairs(stations) do
-                    if st.name ~= target.name
-                        and not (st.x == target.x and st.y == target.y)
-                        and reachable[skey(st.x, st.y)]
-                        and st.sells and st.sells[good]
-                        and not (st.buys and st.buys[good]) then
-                        supplierCount = supplierCount + 1
-                        goodsWithSource[good] = true
+                local hasPair = false
+                for _, target in pairs(stations) do
+                    if target.buys and target.buys[good] then
+                        for _, source in pairs(stations) do
+                            if not (source.name == target.name and source.factionIndex == target.factionIndex)
+                                and source.sells and source.sells[good]
+                                and not (source.buys and source.buys[good]) then
+                                supplierCount = supplierCount + 1
+                                hasPair = true
+                            end
+                        end
                     end
                 end
+                if hasPair then goodsWithSource[good] = true end
             end
         end
     end
@@ -1009,10 +1038,10 @@ end
 function StockFactoryCommand:generateAssessmentFromPrediction(prediction, captain, ownerIndex, shipName, area, config)
     local intro = {}
     if prediction.numGoodsWithSource > 0 then
-        table.insert(intro, "We can keep that station stocked, Commander. I know where to get the goods."%_t)
-        table.insert(intro, "Leave the logistics to me. I'll make sure the station never runs dry."%_t)
+        table.insert(intro, "We can stock your anchor region, Commander. I know where to move those goods."%_t)
+        table.insert(intro, "Leave the logistics to me. I'll keep those sector stations supplied."%_t)
     else
-        table.insert(intro, "I can't find any of our stations nearby that supply what this one needs."%_t)
+        table.insert(intro, "I can't find producer and consumer stations for those goods in the anchor region."%_t)
     end
 
     local autonomy = {}
@@ -1036,24 +1065,30 @@ end
 -- client UI
 ---------------------------------------------------------------------
 
--- collects the goods a station buys that are eligible to be ferried (sorted)
-local function targetInputGoods(station)
+-- collects the goods traded by the anchor-region stations (consumed or produced),
+-- filtered to eligible goods and sorted.
+local function anchorRegionGoods(stations)
     local list = {}
-    if station and station.buys then
-        for good, _ in pairs(station.buys) do
-            if isGoodEligible(good) then
+    local seen = {}
+
+    for _, station in pairs(stations or {}) do
+        for good, _ in pairs(station.buys or {}) do
+            if not seen[good] and isGoodEligible(good) then
+                seen[good] = true
+                table.insert(list, good)
+            end
+        end
+
+        for good, _ in pairs(station.sells or {}) do
+            if not seen[good] and isGoodEligible(good) then
+                seen[good] = true
                 table.insert(list, good)
             end
         end
     end
+
     table.sort(list)
     return list
-end
-
-local function findStation(stations, name)
-    for _, st in pairs(stations or {}) do
-        if st.name == name then return st end
-    end
 end
 
 function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback)
@@ -1081,18 +1116,19 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.fontColor = ColorRGB(0.7, 0.7, 0.7)
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
-        "Keeps the selected station stocked."%_t .. "\n\n" ..
-        "The ship automatically ferries the goods you select to that station, taking them from your own stations that produce them and are connected to it through the gate network."%_t .. "\n\n" ..
-        "It never hauls more than the station needs, and never takes a good from a station that also buys it."%_t
+        "Anchors to one sector and operates in that sector plus sectors up to 3 gate jumps away."%_t .. "\n\n" ..
+        "The ship ferries only the goods you select, moving them between your own producer and consumer stations in that anchor region."%_t .. "\n\n" ..
+        "It never hauls more than a consumer station needs, and never takes a good from a station that also buys it."%_t
 
-    -- config: target station + goods checklist
+    -- config: anchor sector + goods checklist
     local configRect = ui.commonUI.configRect
     local vlist = UIVerticalLister(configRect, 8, 0)
 
     local headerRect = vlist:nextRect(20)
     local headerSplit = UIVerticalSplitter(headerRect, 8, 0, 0.35)
-    ui.window:createLabel(headerSplit.left, "Station:"%_t, 13)
-    ui.targetCombo = ui.window:createValueComboBox(headerSplit.right, configChangedCallback)
+    ui.window:createLabel(headerSplit.left, "Anchor Sector:"%_t, 13)
+    ui.anchorSectorLabel = ui.window:createLabel(headerSplit.right, ""%_t, 13)
+    ui.anchorSectorLabel:setCenterAligned()
 
     vlist:nextRect(4)
     ui.window:createLabel(vlist:nextRect(15), "Goods to keep stocked:"%_t, 12)
@@ -1153,7 +1189,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.clear = function(self, shipName)
         self.commonUI:clear(shipName)
-        self.targetCombo:clear()
+        self.anchorSectorLabel.caption = ""%_t
         for _, box in pairs(self.goodBoxes) do
             box.goodName = nil
             box.checkbox:setCheckedNoCallback(false)
@@ -1162,17 +1198,18 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         end
     end
 
-    -- fills the target combo with owned stations in the ship's sector, and the
-    -- goods checklist with the selected station's input goods
+    -- fills the goods checklist from all owned stations in the selected
+    -- anchor region (anchor + up to 3 gate jumps)
     ui.refreshInputs = function(self, ownerIndex, shipName, area)
         local stations = (area.analysis or {}).stations or {}
+        local ax, ay = areaAnchor(area)
+        if ax then
+            self.anchorSectorLabel.caption = "\\s(" .. ax .. ":" .. ay .. ")"
+        else
+            self.anchorSectorLabel.caption = ""%_t
+        end
 
-        local ship = ShipDatabaseEntry(ownerIndex, shipName)
-        if not valid(ship) then return end
-        local sx, sy = ship:getCoordinates()
-
-        -- remember current selection & checked goods
-        local previousTarget = self.targetCombo.selectedValue
+        -- remember checked goods
         local checked = {}
         for _, box in pairs(self.goodBoxes) do
             if box.goodName and box.checkbox.visible and box.checkbox.checked then
@@ -1180,29 +1217,8 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             end
         end
 
-        -- rebuild target combo
-        self.targetCombo:clear()
-        local candidates = {}
-        for _, st in pairs(stations) do
-            if st.x == sx and st.y == sy and #targetInputGoods(st) > 0 then
-                local entry = ShipDatabaseEntry(ownerIndex, st.name)
-                local title = valid(entry) and entry:getTitle():translated() or ""
-                local text = st.name
-                if title ~= "" then text = title .. " - " .. st.name end
-                table.insert(candidates, {name = st.name, text = text})
-            end
-        end
-        table.sort(candidates, function(a, b) return a.text < b.text end)
-        for _, c in pairs(candidates) do
-            self.targetCombo:addEntry(c.name, c.text)
-        end
-        if previousTarget then
-            self.targetCombo:setSelectedValueNoCallback(previousTarget)
-        end
-
-        -- rebuild goods checklist for the selected target
-        local target = findStation(stations, self.targetCombo.selectedValue)
-        local inputGoods = targetInputGoods(target)
+        -- rebuild goods checklist for the whole anchor region
+        local inputGoods = anchorRegionGoods(stations)
 
         for i, box in ipairs(self.goodBoxes) do
             local good = inputGoods[i]
@@ -1240,7 +1256,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
         self.commonUI:refreshPredictions(ownerIndex, shipName, area, config, StockFactoryCommand, prediction)
 
-        if not config.target or not config.goods or #config.goods == 0 then
+        if not config.goods or #config.goods == 0 then
             self.commonUI.startButton.active = false
         end
     end
@@ -1254,7 +1270,6 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.buildConfig = function(self)
         local config = {}
         config.escorts = self.commonUI.escortUI:buildConfig()
-        config.target = self.targetCombo.selectedValue
         config.goods = {}
 
         for _, box in pairs(self.goodBoxes) do
@@ -1268,16 +1283,6 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.displayConfig = function(self, config, ownerIndex)
         -- read-only display of a running command
-        self.targetCombo:clear()
-        if config.target then
-            local entry = ShipDatabaseEntry(ownerIndex, config.target)
-            local title = valid(entry) and entry:getTitle():translated() or ""
-            local text = config.target
-            if title ~= "" then text = title .. " - " .. config.target end
-            self.targetCombo:addEntry(config.target, text)
-            self.targetCombo:setSelectedValueNoCallback(config.target)
-        end
-
         local goodsList = config.goods or {}
         for i, box in ipairs(self.goodBoxes) do
             local good = goodsList[i]
@@ -1298,7 +1303,6 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
-        self.targetCombo.active = active
         for _, box in pairs(self.goodBoxes) do
             box.checkbox.active = active
         end

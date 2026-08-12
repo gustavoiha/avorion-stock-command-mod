@@ -45,8 +45,8 @@ local function stockFactoryRouteSectors(shipName)
 
     for _, command in pairs(Simulation.commands) do
         if command.shipName == shipName and command.data then
-            local target = command.data.target
-            if target then addSector(target.x, target.y) end
+            local anchor = command.data.anchor
+            if anchor then addSector(anchor.x, anchor.y) end
 
             for _, station in pairs(command.data.stations or {}) do
                 addSector(station.x, station.y)
