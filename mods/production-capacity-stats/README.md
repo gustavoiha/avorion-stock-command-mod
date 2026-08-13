@@ -1,9 +1,8 @@
 # Optimal Production Capacity Stats
 
 While you are in build mode on a station that produces goods (factories and
-mines), this mod adds a small toggle button in the bottom-left corner. Open it
-to see a compact overlay with both the production capacity readout and the
-estimated production cycle time:
+mines), this mod shows a compact overlay in the bottom-right corner with both
+the production capacity readout and the estimated production cycle time:
 
 ```
 Production Capacity
@@ -17,9 +16,8 @@ Production Capacity
 - **Cycle**: the estimated resulting production cycle time in whole seconds,
   truncated after applying the game's minimum 15 second floor.
 
-The overlay starts closed each time you enter build mode. Stations that don't
-produce goods never show the toggle or overlay, so the default build stats are
-unaffected.
+Stations that don't produce goods never show the overlay, so the default build
+stats are unaffected.
 
 ## How the requirement is calculated
 
