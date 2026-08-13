@@ -130,7 +130,7 @@ function ProductionCapacityStats.initialize()
     titleLabel.outline = true
     titleLabel:hide()
 
-    capacityTitleLabel = container:createLabel(Rect(vec2(left, top + 18), vec2(right - 48, top + 31)), "Capacity", 12)
+    capacityTitleLabel = container:createLabel(Rect(vec2(left, top + 18), vec2(right - 48, top + 31)), "Capacity"%_t, 12)
     capacityTitleLabel:setLeftAligned()
     capacityTitleLabel.color = ColorRGB(0.72, 0.72, 0.72)
     capacityTitleLabel.outline = true
@@ -141,7 +141,7 @@ function ProductionCapacityStats.initialize()
     capacityValueLabel.outline = true
     capacityValueLabel:hide()
 
-    cycleTimeTitleLabel = container:createLabel(Rect(vec2(left, top + 32), vec2(right - 48, top + 45)), "Cycle Time", 12)
+    cycleTimeTitleLabel = container:createLabel(Rect(vec2(left, top + 32), vec2(right - 48, top + 45)), "Cycle Time"%_t, 12)
     cycleTimeTitleLabel:setLeftAligned()
     cycleTimeTitleLabel.color = ColorRGB(0.72, 0.72, 0.72)
     cycleTimeTitleLabel.outline = true

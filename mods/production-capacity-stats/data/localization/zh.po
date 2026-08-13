@@ -1,0 +1,8 @@
+# ========== /Users/gustavoiha/.avorion/mods/production_capacity_stats/data/scripts/player/ui/productioncapacitystats.lua ==========
+#: /Users/gustavoiha/.avorion/mods/production_capacity_stats/data/scripts/player/ui/productioncapacitystats.lua:
+msgid "Capacity"
+msgstr "产能"
+
+#: /Users/gustavoiha/.avorion/mods/production_capacity_stats/data/scripts/player/ui/productioncapacitystats.lua:
+msgid "Cycle Time"
+msgstr "循环时间"
