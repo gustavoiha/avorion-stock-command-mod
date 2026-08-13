@@ -1,0 +1,4 @@
+# ========== /Users/gustavoiha/.avorion/mods/core_distance_label/data/scripts/player/map/coredistancelabel.lua ==========
+#: /Users/gustavoiha/.avorion/mods/core_distance_label/data/scripts/player/map/coredistancelabel.lua:
+msgid "Distance to center of galaxy: %.1f"
+msgstr "Расстояние до центра галактики: %.1f"
