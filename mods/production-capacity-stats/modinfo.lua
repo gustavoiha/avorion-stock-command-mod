@@ -6,12 +6,9 @@ meta =
     title = "Optimal Production Capacity Stats",
     type = "mod",
 
-    description = "While building a factory or mine, shows the station's current "
-        .. "production capacity next to the amount it actually needs, in the same "
-        .. "\"have/need\" form the game uses for crew quarters. Factories run on a "
-        .. "free baseline of 100 production capacity, so anything a station needs "
-        .. "below that baseline is reported as 0. Stations that don't produce goods "
-        .. "are not affected.",
+    description = "In build mode on a factory or mine, shows an overlay with the "
+        .. "station's current production capacity vs. how much it needs for the fastest "
+        .. "cycle, plus the resulting cycle time. Non-production stations are unaffected.",
 
     authors = {"Gugs_Iha"},
     version = "1.0",
