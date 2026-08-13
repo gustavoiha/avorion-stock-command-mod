@@ -6,9 +6,9 @@ meta =
     title = "Galactic Core Distance Label",
     type = "mod",
 
-    description = "Shows the euclidean distance between the sector selected on the "
-        .. "galaxy map and the galactic core (0:0). The readout sits in the lower "
-        .. "left edge of the map so it never covers the map itself or any tooltip.",
+    description = "Always know how close you are to the core without doing the math yourself. "
+        .. "The galaxy map gets a small label in the lower-left corner showing the euclidean "
+        .. "straight-line distance from the selected sector to 0:0. ",
 
     authors = {"Gugs_Iha"},
     version = "1.0",
