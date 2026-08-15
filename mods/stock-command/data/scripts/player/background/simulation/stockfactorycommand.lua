@@ -733,6 +733,29 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
                             buys[good.name] = script
                             hasTrade = true
                         end
+
+                        -- factory.lua stores the production recipe even before first output;
+                        -- use it so an empty-but-configured factory still appears as a source
+                        if values.production then
+                            for _, result in pairs(values.production.results or {}) do
+                                if result.name and not sells[result.name] then
+                                    sells[result.name] = script
+                                    hasTrade = true
+                                end
+                            end
+                            for _, garbage in pairs(values.production.garbages or {}) do
+                                if garbage.name and not sells[garbage.name] then
+                                    sells[garbage.name] = script
+                                    hasTrade = true
+                                end
+                            end
+                            for _, ingredient in pairs(values.production.ingredients or {}) do
+                                if ingredient.name and not buys[ingredient.name] then
+                                    buys[ingredient.name] = script
+                                    hasTrade = true
+                                end
+                            end
+                        end
                     end
                 end
 
@@ -1008,7 +1031,8 @@ end
 function StockFactoryCommand:getPredictableValues()
     local values = {}
     values.attackChance = {displayName = SimulationUtility.AttackChanceLabelCaption}
-    values.suppliers = {displayName = "Suppliers in Range"%_t}
+    values.producers = {displayName = "Producers in Range"%_t}
+    values.consumers = {displayName = "Consumers in Range"%_t}
     return values
 end
 
@@ -1022,7 +1046,8 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     local analysis = area.analysis or {}
     local stations = analysis.stations or {}
 
-    local supplierCount = 0
+    local producerStations = {}
+    local consumerStations = {}
     local goodsWithSource = {}
     local goodsWithConsumer = {}
 
@@ -1033,11 +1058,14 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
                 for _, target in pairs(stations) do
                     if target.buys and target.buys[good] then
                         goodsWithConsumer[good] = true
+                        local tkey = (target.factionIndex or 0) .. ":" .. target.name
+                        consumerStations[tkey] = true
                         for _, source in pairs(stations) do
                             if not (source.name == target.name and source.factionIndex == target.factionIndex)
                                 and source.sells and source.sells[good]
                                 and not (source.buys and source.buys[good]) then
-                                supplierCount = supplierCount + 1
+                                local srckey = (source.factionIndex or 0) .. ":" .. source.name
+                                producerStations[srckey] = true
                                 hasPair = true
                             end
                         end
@@ -1048,8 +1076,10 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
         end
     end
 
-    prediction.suppliers.value = supplierCount
-    prediction.supplierCount = supplierCount
+    prediction.producers.value = tablelength(producerStations)
+    prediction.consumers.value = tablelength(consumerStations)
+    prediction.producerCount = prediction.producers.value
+    prediction.consumerCount = prediction.consumers.value
     prediction.numGoodsWithSource = tablelength(goodsWithSource)
     prediction.numGoodsWithConsumer = tablelength(goodsWithConsumer)
 
@@ -1058,7 +1088,7 @@ end
 
 function StockFactoryCommand:generateAssessmentFromPrediction(prediction, captain, ownerIndex, shipName, area, config)
     local intro = {}
-    if prediction.numGoodsWithSource > 0 then
+    if prediction.numGoodsWithConsumer > 0 then
         table.insert(intro, "We can stock your anchor region, Commander. I know where to move those goods."%_t)
         table.insert(intro, "Leave the logistics to me. I'll keep those sector stations supplied."%_t)
     else
@@ -1195,9 +1225,14 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.cargoSpaceLabel:setCenterAligned()
 
     local row = UIVerticalSplitter(plist:nextRect(15), 5, 0, 0.65)
-    ui.window:createLabel(row.left, predictable.suppliers.displayName .. ":", 12)
-    ui.suppliersLabel = ui.window:createLabel(row.right, "", 12)
-    ui.suppliersLabel:setCenterAligned()
+    ui.window:createLabel(row.left, predictable.producers.displayName .. ":", 12)
+    ui.producersLabel = ui.window:createLabel(row.right, "", 12)
+    ui.producersLabel:setCenterAligned()
+
+    local row = UIVerticalSplitter(plist:nextRect(15), 5, 0, 0.65)
+    ui.window:createLabel(row.left, predictable.consumers.displayName .. ":", 12)
+    ui.consumersLabel = ui.window:createLabel(row.right, "", 12)
+    ui.consumersLabel:setCenterAligned()
 
     local row = UIVerticalSplitter(plist:nextRect(15), 5, 0, 0.65)
     ui.window:createLabel(row.left, "Runtime:"%_t, 12)
@@ -1284,7 +1319,8 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.displayPrediction = function(self, prediction, config, ownerIndex)
         self.cargoSpaceLabel.caption = math.floor(prediction.freeCargoSpace or 0)
-        self.suppliersLabel.caption = tostring(prediction.supplierCount or 0)
+        self.producersLabel.caption = tostring(prediction.producerCount or 0)
+        self.consumersLabel.caption = tostring(prediction.consumerCount or 0)
         self.commonUI:setAttackChance(prediction.attackChance or 0)
     end
 
