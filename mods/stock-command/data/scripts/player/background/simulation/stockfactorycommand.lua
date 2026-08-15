@@ -127,9 +127,6 @@ function StockFactoryCommand:onStart()
     self.data.phase = "idle"
     self.data.timer = 0
     self.data.rescanCooldown = 0
-    self.data.cursor = 0
-    self.data.sourceCursor = 0
-    self.data.cycleCount = 0  -- tracks how many different goods we've tried in this cycle
     self.data.remapCooldown = RemapInterval
 
     local owner = getParentFaction()
@@ -264,19 +261,6 @@ function StockFactoryCommand:estimateTravelTime(source, target)
     return jumps * SecondsPerGateJump + DockingSeconds
 end
 
-function StockFactoryCommand:advanceGoodsCursor()
-    -- increment cursor to next good in the config list
-    self.data.cursor = (self.data.cursor or 0) + 1
-    self.data.cycleCount = (self.data.cycleCount or 0) + 1
-    local goodsList = self.config.goods or {}
-    -- wrap around if we've cycled through all goods
-    if self.data.cycleCount >= #goodsList then
-        self.data.cycleCount = 0  -- reset cycle count for next full cycle
-        return true  -- signal that we've completed a full cycle
-    end
-    return false  -- still have more goods to try in this cycle
-end
-
 function StockFactoryCommand:planNextHaul()
     local goodsList = self.config.goods or {}
     if #goodsList == 0 then
@@ -285,64 +269,53 @@ function StockFactoryCommand:planNextHaul()
         return
     end
 
-    local n = #goodsList
-    local cursor = self.data.cursor or 0
+    -- Build all valid source/target pairs for selected goods and choose one at
+    -- random so the route order is not predictable (not alphabetical/rotational).
+    local candidates = {}
 
-    -- rotate through the selected goods so all of them get serviced over time
-    for attempt = 0, n - 1 do
-        local gi = ((cursor + attempt) % n) + 1
-        local good = goodsList[gi]
-
+    for _, good in pairs(goodsList) do
         if isGoodEligible(good) then
             local targets = self:eligibleTargets(good)
-
-            if #targets > 0 then
-                local tStart = self.data.targetCursor or 0
-
-                for tAttempt = 0, #targets - 1 do
-                    local ti = ((tStart + tAttempt) % #targets) + 1
-                    local target = targets[ti]
-                    local sources = self:eligibleSources(good, target)
-
-                    if #sources > 0 then
-                        -- rotate through the possible sources too
-                        local sIdx = ((self.data.sourceCursor or 0) % #sources) + 1
-                        local source = sources[sIdx]
-
-                        self.data.cursor = cursor + attempt + 1
-                        self.data.targetCursor = tStart + tAttempt + 1
-                        self.data.sourceCursor = (self.data.sourceCursor or 0) + 1
-                        self.data.cycleCount = 0  -- reset cycle count when we find a haul
-
-                        self.data.currentHaul = {
-                            good = good,
-                            source = {
-                                name = source.name,
-                                factionIndex = source.factionIndex,
-                                x = source.x,
-                                y = source.y,
-                                script = source.sells[good],
-                            },
-                            target = {
-                                name = target.name,
-                                factionIndex = target.factionIndex,
-                                x = target.x,
-                                y = target.y,
-                                script = target.buys[good],
-                            },
-                            travelTime = self:estimateTravelTime(source, target),
-                            pickupTravelTime = self:estimateTravelTime(source, target),
-                            deliveryTravelTime = self:estimateTravelTime(source, target),
-                            carriedAmount = 0,
-                        }
-
-                        self.data.phase = "haulingToSource"
-                        self.data.timer = 0
-                        return
-                    end
+            for _, target in pairs(targets) do
+                local sources = self:eligibleSources(good, target)
+                for _, source in pairs(sources) do
+                    table.insert(candidates, {good = good, source = source, target = target})
                 end
             end
         end
+    end
+
+    if #candidates > 0 then
+        local pick = candidates[random():getInt(1, #candidates)]
+        local good = pick.good
+        local source = pick.source
+        local target = pick.target
+
+        self.data.currentHaul = {
+            good = good,
+            source = {
+                name = source.name,
+                factionIndex = source.factionIndex,
+                x = source.x,
+                y = source.y,
+                script = source.sells[good],
+            },
+            target = {
+                name = target.name,
+                factionIndex = target.factionIndex,
+                x = target.x,
+                y = target.y,
+                script = target.buys[good],
+            },
+            travelTime = self:estimateTravelTime(source, target),
+            pickupTravelTime = self:estimateTravelTime(source, target),
+            deliveryTravelTime = self:estimateTravelTime(source, target),
+            carriedAmount = 0,
+        }
+
+        self.data.phase = "haulingToSource"
+        self.data.timer = 0
+        return
     end
 
     -- nothing to fetch right now: stay assigned, idle near the station, re-scan later
@@ -537,6 +510,7 @@ function StockFactoryCommand:reportTargetStock(good, stock, maxStock)
     if not self.transaction then return end
     self.transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
     self.transaction.targetReceived = true
+
     self:tryExecuteHaul()
 end
 
@@ -544,6 +518,7 @@ function StockFactoryCommand:reportSourceStock(good, stock, maxStock)
     if not self.transaction then return end
     self.transaction.sourceStock = stock or 0
     self.transaction.sourceReceived = true
+
     self:tryExecuteHaul()
 end
 
@@ -575,18 +550,10 @@ function StockFactoryCommand:tryExecuteHaul()
 
     if not amount or amount <= 0 then
         -- source has no stock yet, or consumer is already full
-        -- try the next good instead of waiting
+        -- try a new random pair soon instead of cycling deterministically
         self.data.currentHaul = nil
         self.data.phase = "idle"
-
-        local completedCycle = self:advanceGoodsCursor()
-        if completedCycle then
-            -- we've tried all goods in this cycle with no stock, now wait before retrying
-            self.data.rescanCooldown = 60
-        else
-            -- still have more goods to try in this cycle, don't wait
-            self.data.rescanCooldown = 0
-        end
+        self.data.rescanCooldown = 5
         return
     end
 
@@ -600,18 +567,10 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
 
     if (removed or 0) <= 0 then
         -- source was empty at pickup time (produced nothing yet)
-        -- try the next good instead of waiting
+        -- retry with a different random pair soon
         self.data.currentHaul = nil
         self.data.phase = "idle"
-
-        local completedCycle = self:advanceGoodsCursor()
-        if completedCycle then
-            -- we've tried all goods in this cycle with no stock, now wait before retrying
-            self.data.rescanCooldown = 60
-        else
-            -- still have more goods to try in this cycle, don't wait
-            self.data.rescanCooldown = 0
-        end
+        self.data.rescanCooldown = 5
         return
     end
 
@@ -1312,36 +1271,42 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui._selectedGoods = {}
     ui._previousGoods = {}
     ui._configChangedCallbackName = configChangedCallback
-    ui._goodsCallback = configChangedCallback
-    ui.goodsList.onSelectFunction = configChangedCallback
+    ui._listSelectionCallbackName = self.type .. "_GoodsListSelectionChanged"
+    ui._selectAllPressedCallback = self.type .. "_SelectAllGoodsPressed"
+    ui._clearPressedCallback = self.type .. "_ClearGoodsSelectionPressed"
+    ui._pendingGoodsToggle = false
+    ui.goodsList.onSelectFunction = ui._listSelectionCallbackName
 
     -- Select All / Clear buttons below the scroll area, using vlist layout
     local buttonRect = vlist:nextRect(20)
     local buttonSplit = UIVerticalSplitter(buttonRect, 5, 0, 0.5)
-    ui.selectAllButton = ui.window:createButton(buttonSplit.left, "Select All"%_t, "")
-    ui.clearSelectionButton = ui.window:createButton(buttonSplit.right, "Clear Selection"%_t, "")
+    ui.selectAllButton = ui.window:createButton(buttonSplit.left, "Select All"%_t, ui._selectAllPressedCallback)
+    ui.clearSelectionButton = ui.window:createButton(buttonSplit.right, "Clear Selection"%_t, ui._clearPressedCallback)
 
-    -- Set up onclick handlers with closure access to ui state
-    local selectAllCallback = function()
+    self.mapCommands[ui._listSelectionCallbackName] = function()
+        ui._pendingGoodsToggle = true
+        self.mapCommands[configChangedCallback]()
+    end
+
+    self.mapCommands[ui._selectAllPressedCallback] = function()
         for i = 0, ui.goodsList.rows - 1 do
             local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
             ui._selectedGoods[goodName] = true
             ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(1, 1, 1))
         end
-        MapCommands[ui._configChangedCallbackName]()
+        ui._pendingGoodsToggle = false
+        self.mapCommands[configChangedCallback]()
     end
 
-    local clearSelectionCallback = function()
+    self.mapCommands[ui._clearPressedCallback] = function()
         for i = 0, ui.goodsList.rows - 1 do
             local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
             ui._selectedGoods[goodName] = nil
             ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(0.65, 0.65, 0.65))
         end
-        MapCommands[ui._configChangedCallbackName]()
+        ui._pendingGoodsToggle = false
+        self.mapCommands[configChangedCallback]()
     end
-
-    ui.selectAllButton.onClickedFunction = selectAllCallback
-    ui.clearSelectionButton.onClickedFunction = clearSelectionCallback
 
     -- prediction panel
     local predictable = self:getPredictableValues()
@@ -1415,6 +1380,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             -- goods list changed: rebuild and select all by default
             self._previousGoods = {}
             for _, g in pairs(inputGoods) do table.insert(self._previousGoods, g) end
+            self._selectedGoods = {}
 
             -- first time: auto-select all goods
             for _, g in pairs(inputGoods) do
@@ -1432,7 +1398,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
                 self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.Text)
                 self.goodsList:setColumnWidth(0, self.goodsList.width)
             end
-            self.goodsList.onSelectFunction = self._goodsCallback
+            self.goodsList.onSelectFunction = self._listSelectionCallbackName
         else
             -- goods unchanged: just update checkbox states
             for i = 0, self.goodsList.rows - 1 do
@@ -1476,8 +1442,10 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     end
 
     ui.buildConfig = function(self)
-        -- toggle the good whose row was just clicked (selectedValue is set by the engine before the callback fires)
-        local clicked = self.goodsList.selectedValue
+        -- only toggle on real list-click callbacks; buildConfig is also called by
+        -- start/prediction flows where selectedValue may still hold stale state.
+        local clicked = self._pendingGoodsToggle and self.goodsList.selectedValue or nil
+        self._pendingGoodsToggle = false
         if clicked and clicked ~= "" then
             self._selectedGoods[clicked] = not self._selectedGoods[clicked]
             -- update that row's color immediately without rebuilding the entire list
@@ -1520,7 +1488,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
         self.goodsList.entriesSelectable = active
-        self.goodsList.onSelectFunction = active and self._goodsCallback or ""
+        self.goodsList.onSelectFunction = active and self._listSelectionCallbackName or ""
         self.selectAllButton.active = active
         self.clearSelectionButton.active = active
     end
