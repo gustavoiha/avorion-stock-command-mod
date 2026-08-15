@@ -15,9 +15,6 @@ local StockFactoryCommand = {}
 StockFactoryCommand.__index = StockFactoryCommand
 StockFactoryCommand.type = CommandType.StockFactory
 
--- how many goods can be shown in the config checklist
-local MaxGoodCheckboxes = 20
-
 -- anchor-sector operating radius over the gate network
 local MaxGateJumps = 5
 
@@ -1054,6 +1051,16 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     if config.goods then
         for _, good in pairs(config.goods) do
             if isGoodEligible(good) then
+                -- count producers independently: any station that sells but doesn't also buy this good
+                for _, source in pairs(stations) do
+                    if source.sells and source.sells[good]
+                        and not (source.buys and source.buys[good]) then
+                        local srckey = (source.factionIndex or 0) .. ":" .. source.name
+                        producerStations[srckey] = true
+                    end
+                end
+
+                -- count consumers independently, and check for complete pairs
                 local hasPair = false
                 for _, target in pairs(stations) do
                     if target.buys and target.buys[good] then
@@ -1064,8 +1071,6 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
                             if not (source.name == target.name and source.factionIndex == target.factionIndex)
                                 and source.sells and source.sells[good]
                                 and not (source.buys and source.buys[good]) then
-                                local srckey = (source.factionIndex or 0) .. ":" .. source.name
-                                producerStations[srckey] = true
                                 hasPair = true
                             end
                         end
@@ -1184,29 +1189,15 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     vlist:nextRect(4)
     ui.window:createLabel(vlist:nextRect(15), "Goods to keep stocked:"%_t, 12)
 
-    -- checklist of goods, laid out in two columns
+    -- scrollable goods checklist
     local gridRect = vlist.inner
-    local columns = UIVerticalMultiSplitter(gridRect, 12, 0, 1)
-    local columnRects = {columns.left, columns.right}
-
-    ui.goodBoxes = {}
-    local perColumn = math.ceil(MaxGoodCheckboxes / 2)
-    for c = 1, 2 do
-        local clist = UIVerticalLister(columnRects[c], 4, 0)
-        for _ = 1, perColumn do
-            local rowRect = clist:nextRect(18)
-            local rowSplit = UIVerticalSplitter(rowRect, 5, 0, 0.12)
-            rowSplit:setLeftQuadratic()
-
-            local checkbox = ui.window:createCheckBox(rowSplit.left, "", configChangedCallback)
-            local label = ui.window:createLabel(rowSplit.right, "", 12)
-
-            checkbox:hide()
-            label:hide()
-
-            table.insert(ui.goodBoxes, {checkbox = checkbox, label = label, goodName = nil})
-        end
-    end
+    ui.goodsList = ui.window:createListBoxEx(gridRect)
+    ui.goodsList.columns = 2
+    ui.goodsList:setColumnWidth(0, 22)
+    ui.goodsList:setColumnWidth(1, gridRect.width - 22)
+    ui.goodsList.entriesSelectable = false
+    ui._goodsCallback = configChangedCallback
+    ui.goodsList.onChangedFunction = configChangedCallback
 
     -- prediction panel
     local predictable = self:getPredictableValues()
@@ -1245,13 +1236,9 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.clear = function(self, shipName)
         self.commonUI:clear(shipName)
-        self.anchorSectorLabel.caption = ""%_t
-        for _, box in pairs(self.goodBoxes) do
-            box.goodName = nil
-            box.checkbox:setCheckedNoCallback(false)
-            box.checkbox:hide()
-            box.label:hide()
-        end
+        self.anchorSectorLabel.caption = ""
+        self.goodsList.onChangedFunction = ""
+        self.goodsList:clear()
     end
 
     -- fills the goods checklist from all owned stations in the selected
@@ -1262,35 +1249,29 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         if ax then
             self.anchorSectorLabel.caption = "\\s(" .. ax .. ":" .. ay .. ")"
         else
-            self.anchorSectorLabel.caption = ""%_t
+            self.anchorSectorLabel.caption = ""
         end
 
-        -- remember checked goods
+        -- remember checked goods before rebuilding
         local checked = {}
-        for _, box in pairs(self.goodBoxes) do
-            if box.goodName and box.checkbox.visible and box.checkbox.checked then
-                checked[box.goodName] = true
-            end
+        for i = 0, self.goodsList.rows - 1 do
+            local checkedState, _, _, _, goodName = self.goodsList:getEntry(0, i)
+            if checkedState ~= "" then checked[goodName] = true end
         end
 
-        -- rebuild goods checklist for the whole anchor region
         local inputGoods = anchorRegionGoods(stations)
 
-        for i, box in ipairs(self.goodBoxes) do
-            local good = inputGoods[i]
-            if good then
-                box.goodName = good
-                box.label.caption = goodDisplayName(good, 2)
-                box.checkbox:setCheckedNoCallback(checked[good] == true)
-                box.checkbox:show()
-                box.label:show()
-            else
-                box.goodName = nil
-                box.checkbox:setCheckedNoCallback(false)
-                box.checkbox:hide()
-                box.label:hide()
-            end
+        self.goodsList.onChangedFunction = ""  -- suspend callback during rebuild
+        self.goodsList:clear()
+        for _, goodName in pairs(inputGoods) do
+            self.goodsList:addRow(goodName)
+            local rowIdx = self.goodsList.rows - 1
+            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
+            self.goodsList:setEntry(0, rowIdx, checked[goodName] and "checked" or "", false, false, ColorRGB(1, 1, 1))
+            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.9, 0.9, 0.9))
+            self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
         end
+        self.goodsList.onChangedFunction = self._goodsCallback
     end
 
     ui.refresh = function(self, ownerIndex, shipName, area, config)
@@ -1329,9 +1310,10 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         config.escorts = self.commonUI.escortUI:buildConfig()
         config.goods = {}
 
-        for _, box in pairs(self.goodBoxes) do
-            if box.goodName and box.checkbox.visible and box.checkbox.checked then
-                table.insert(config.goods, box.goodName)
+        for i = 0, self.goodsList.rows - 1 do
+            local checkedState, _, _, _, goodName = self.goodsList:getEntry(0, i)
+            if checkedState ~= "" then
+                table.insert(config.goods, goodName)
             end
         end
 
@@ -1340,29 +1322,21 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 
     ui.displayConfig = function(self, config, ownerIndex)
         -- read-only display of a running command
-        local goodsList = config.goods or {}
-        for i, box in ipairs(self.goodBoxes) do
-            local good = goodsList[i]
-            if good then
-                box.goodName = good
-                box.label.caption = goodDisplayName(good, 2)
-                box.checkbox:setCheckedNoCallback(true)
-                box.checkbox:show()
-                box.label:show()
-            else
-                box.goodName = nil
-                box.checkbox:setCheckedNoCallback(false)
-                box.checkbox:hide()
-                box.label:hide()
-            end
+        self.goodsList.onChangedFunction = ""
+        self.goodsList:clear()
+        for _, goodName in pairs(config.goods or {}) do
+            self.goodsList:addRow(goodName)
+            local rowIdx = self.goodsList.rows - 1
+            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
+            self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(0.7, 0.7, 0.7))
+            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.7, 0.7, 0.7))
+            self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
         end
     end
 
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
-        for _, box in pairs(self.goodBoxes) do
-            box.checkbox.active = active
-        end
+        self.goodsList.onChangedFunction = active and self._goodsCallback or ""
     end
 
     ui.onWindowClosed = function(self)
