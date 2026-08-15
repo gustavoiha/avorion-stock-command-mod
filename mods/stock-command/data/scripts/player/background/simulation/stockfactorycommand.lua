@@ -806,6 +806,19 @@ function StockFactoryCommand:hasAnyReachableSource()
     return false
 end
 
+-- returns true when at least one consumer exists for any selected good; used to
+-- decide whether to recall (no consumer = permanently stuck) vs. wait (no source yet)
+function StockFactoryCommand:hasAnyConsumer()
+    for _, good in pairs(self.config.goods or {}) do
+        if isGoodEligible(good) then
+            if #self:eligibleTargets(good) > 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- re-scan owned stations and recompute the reachable region + gate route from the
 -- target, so the command follows the galaxy over time (gates turning hostile,
 -- suppliers built or destroyed). If nothing can be reached any more the ship can't
@@ -831,8 +844,8 @@ function StockFactoryCommand:remapRoute()
     self.data.gateDepth = gateDepth
     self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
 
-    if not self:hasAnyReachableSource() then
-        self:setRuntimeError("Commander, there are no producer/consumer station pairs for the selected goods in the anchor region. Recalling."%_T)
+    if not self:hasAnyConsumer() then
+        self:setRuntimeError("Commander, the consumer stations for the selected goods are gone from the anchor region. Recalling."%_T)
     end
 end
 
@@ -965,8 +978,8 @@ function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
 
     local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
 
-    if prediction.numGoodsWithSource == 0 then
-        return "No producer/consumer station pairs for the selected goods were found in the anchor region (up to 5 gate jumps)."%_t
+    if prediction.numGoodsWithConsumer == 0 then
+        return "No consumer stations for the selected goods were found in the anchor region (up to 5 gate jumps). Add a station that buys those goods."%_t
     end
 
     return
@@ -1011,6 +1024,7 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
 
     local supplierCount = 0
     local goodsWithSource = {}
+    local goodsWithConsumer = {}
 
     if config.goods then
         for _, good in pairs(config.goods) do
@@ -1018,6 +1032,7 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
                 local hasPair = false
                 for _, target in pairs(stations) do
                     if target.buys and target.buys[good] then
+                        goodsWithConsumer[good] = true
                         for _, source in pairs(stations) do
                             if not (source.name == target.name and source.factionIndex == target.factionIndex)
                                 and source.sells and source.sells[good]
@@ -1036,6 +1051,7 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     prediction.suppliers.value = supplierCount
     prediction.supplierCount = supplierCount
     prediction.numGoodsWithSource = tablelength(goodsWithSource)
+    prediction.numGoodsWithConsumer = tablelength(goodsWithConsumer)
 
     return prediction
 end
