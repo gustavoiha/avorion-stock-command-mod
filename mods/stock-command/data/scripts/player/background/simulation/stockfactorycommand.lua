@@ -509,9 +509,10 @@ function StockFactoryCommand:tryExecuteHaul()
     self.transaction = nil
 
     if not amount or amount <= 0 then
+        -- source has no stock yet, or consumer is already full — wait and retry
         self.data.currentHaul = nil
         self.data.phase = "idle"
-        self.data.rescanCooldown = 30
+        self.data.rescanCooldown = 60
         return
     end
 
@@ -524,8 +525,10 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
     if not haul then return end
 
     if (removed or 0) <= 0 then
-        -- pickup failed: abort the command and return to player control with empty hold
-        self:setRuntimeError("Commander, I couldn't pick up cargo from %1%. Aborting the command."%_T, haul.source.name)
+        -- source was empty at pickup time (produced nothing yet) — wait and retry
+        self.data.currentHaul = nil
+        self.data.phase = "idle"
+        self.data.rescanCooldown = 60
         return
     end
 
