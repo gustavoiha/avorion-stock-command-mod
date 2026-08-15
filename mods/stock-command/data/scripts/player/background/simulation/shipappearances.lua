@@ -48,6 +48,21 @@ local function stockFactoryRouteSectors(shipName)
             local anchor = command.data.anchor
             if anchor then addSector(anchor.x, anchor.y) end
 
+            local haul = command.data.currentHaul
+            if haul then
+                local phase = command.data.phase
+                if phase == "haulingToSource" or phase == "transactingPickup" then
+                    if haul.source then addSector(haul.source.x, haul.source.y) end
+                    if haul.target then addSector(haul.target.x, haul.target.y) end
+                elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
+                    if haul.target then addSector(haul.target.x, haul.target.y) end
+                    if haul.source then addSector(haul.source.x, haul.source.y) end
+                else
+                    if haul.source then addSector(haul.source.x, haul.source.y) end
+                    if haul.target then addSector(haul.target.x, haul.target.y) end
+                end
+            end
+
             for _, station in pairs(command.data.stations or {}) do
                 addSector(station.x, station.y)
             end

@@ -129,6 +129,7 @@ function StockFactoryCommand:onStart()
     self.data.rescanCooldown = 0
     self.data.cursor = 0
     self.data.sourceCursor = 0
+    self.data.cycleCount = 0  -- tracks how many different goods we've tried in this cycle
     self.data.remapCooldown = RemapInterval
 
     local owner = getParentFaction()
@@ -166,18 +167,29 @@ function StockFactoryCommand:update(timeStep)
         end
         self:planNextHaul()
 
-    elseif phase == "hauling" then
+    elseif phase == "haulingToSource" then
         local haul = self.data.currentHaul
         if not haul then
             self.data.phase = "idle"
             return
         end
 
-        if self.data.timer >= (haul.travelTime or 60) then
-            self:beginTransaction()
+        if self.data.timer >= (haul.pickupTravelTime or haul.travelTime or 60) then
+            self:beginPickupTransaction()
         end
 
-    elseif phase == "transacting" then
+    elseif phase == "haulingToTarget" then
+        local haul = self.data.currentHaul
+        if not haul then
+            self.data.phase = "idle"
+            return
+        end
+
+        if self.data.timer >= (haul.deliveryTravelTime or haul.travelTime or 60) then
+            self:beginDeliveryTransaction()
+        end
+
+    elseif phase == "transactingPickup" or phase == "transactingDelivery" then
         -- waiting for the asynchronous sector probes / transfers to report back.
         -- if they never do (e.g. a sector got unloaded), recover after a while.
         if self.data.timer >= 300 then
@@ -252,6 +264,19 @@ function StockFactoryCommand:estimateTravelTime(source, target)
     return jumps * SecondsPerGateJump + DockingSeconds
 end
 
+function StockFactoryCommand:advanceGoodsCursor()
+    -- increment cursor to next good in the config list
+    self.data.cursor = (self.data.cursor or 0) + 1
+    self.data.cycleCount = (self.data.cycleCount or 0) + 1
+    local goodsList = self.config.goods or {}
+    -- wrap around if we've cycled through all goods
+    if self.data.cycleCount >= #goodsList then
+        self.data.cycleCount = 0  -- reset cycle count for next full cycle
+        return true  -- signal that we've completed a full cycle
+    end
+    return false  -- still have more goods to try in this cycle
+end
+
 function StockFactoryCommand:planNextHaul()
     local goodsList = self.config.goods or {}
     if #goodsList == 0 then
@@ -287,6 +312,7 @@ function StockFactoryCommand:planNextHaul()
                         self.data.cursor = cursor + attempt + 1
                         self.data.targetCursor = tStart + tAttempt + 1
                         self.data.sourceCursor = (self.data.sourceCursor or 0) + 1
+                        self.data.cycleCount = 0  -- reset cycle count when we find a haul
 
                         self.data.currentHaul = {
                             good = good,
@@ -305,9 +331,12 @@ function StockFactoryCommand:planNextHaul()
                                 script = target.buys[good],
                             },
                             travelTime = self:estimateTravelTime(source, target),
+                            pickupTravelTime = self:estimateTravelTime(source, target),
+                            deliveryTravelTime = self:estimateTravelTime(source, target),
+                            carriedAmount = 0,
                         }
 
-                        self.data.phase = "hauling"
+                        self.data.phase = "haulingToSource"
                         self.data.timer = 0
                         return
                     end
@@ -406,23 +435,30 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount)
 end
 ]]
 
-function StockFactoryCommand:querySectors()
+function StockFactoryCommand:querySectors(needSource, needTarget)
     local haul = self.data.currentHaul
     local t = haul and haul.target
     local s = haul and haul.source
     if not t or not s then return false end
 
-    Galaxy():keepOrGetSector(t.x, t.y, 90)
-    Galaxy():keepOrGetSector(s.x, s.y, 90)
+    if needTarget then
+        Galaxy():keepOrGetSector(t.x, t.y, 90)
+    end
+    if needSource then
+        Galaxy():keepOrGetSector(s.x, s.y, 90)
+    end
 
-    if not Galaxy():sectorLoaded(t.x, t.y) or not Galaxy():sectorLoaded(s.x, s.y) then
+    if needTarget and not Galaxy():sectorLoaded(t.x, t.y) then
+        return false
+    end
+    if needSource and not Galaxy():sectorLoaded(s.x, s.y) then
         return false
     end
 
     return true
 end
 
-function StockFactoryCommand:beginTransaction()
+function StockFactoryCommand:beginPickupTransaction()
     local haul = self.data.currentHaul
     local owner = getParentFaction()
     local t = haul.target
@@ -436,7 +472,7 @@ function StockFactoryCommand:beginTransaction()
         return
     end
 
-    if not self:querySectors() then
+    if not self:querySectors(true, true) then
         -- sectors not loaded yet: keep trying for a while, then give up this haul
         self.data.probeRetries = (self.data.probeRetries or 0) + 1
         if self.data.probeRetries > 15 then
@@ -461,7 +497,39 @@ function StockFactoryCommand:beginTransaction()
     runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock")
     runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock")
 
-    self.data.phase = "transacting"
+    self.data.phase = "transactingPickup"
+    self.data.timer = 0
+end
+
+function StockFactoryCommand:beginDeliveryTransaction()
+    local haul = self.data.currentHaul
+    local owner = getParentFaction()
+    if not haul or not owner then return end
+
+    local amount = haul.carriedAmount or 0
+    if amount <= 0 then
+        self.data.currentHaul = nil
+        self.data.phase = "idle"
+        self.data.rescanCooldown = 0
+        return
+    end
+
+    if not self:querySectors(false, true) then
+        self.data.probeRetries = (self.data.probeRetries or 0) + 1
+        if self.data.probeRetries > 15 then
+            self.data.probeRetries = 0
+            self.data.currentHaul = nil
+            self.data.phase = "idle"
+            self.data.rescanCooldown = 60
+        end
+        return
+    end
+    self.data.probeRetries = 0
+
+    local t = haul.target
+    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, haul.good, amount)
+
+    self.data.phase = "transactingDelivery"
     self.data.timer = 0
 end
 
@@ -506,10 +574,19 @@ function StockFactoryCommand:tryExecuteHaul()
     self.transaction = nil
 
     if not amount or amount <= 0 then
-        -- source has no stock yet, or consumer is already full — wait and retry
+        -- source has no stock yet, or consumer is already full
+        -- try the next good instead of waiting
         self.data.currentHaul = nil
         self.data.phase = "idle"
-        self.data.rescanCooldown = 60
+
+        local completedCycle = self:advanceGoodsCursor()
+        if completedCycle then
+            -- we've tried all goods in this cycle with no stock, now wait before retrying
+            self.data.rescanCooldown = 60
+        else
+            -- still have more goods to try in this cycle, don't wait
+            self.data.rescanCooldown = 0
+        end
         return
     end
 
@@ -522,20 +599,31 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
     if not haul then return end
 
     if (removed or 0) <= 0 then
-        -- source was empty at pickup time (produced nothing yet) — wait and retry
+        -- source was empty at pickup time (produced nothing yet)
+        -- try the next good instead of waiting
         self.data.currentHaul = nil
         self.data.phase = "idle"
-        self.data.rescanCooldown = 60
+
+        local completedCycle = self:advanceGoodsCursor()
+        if completedCycle then
+            -- we've tried all goods in this cycle with no stock, now wait before retrying
+            self.data.rescanCooldown = 60
+        else
+            -- still have more goods to try in this cycle, don't wait
+            self.data.rescanCooldown = 0
+        end
         return
     end
 
     -- log the pickup to economy chat
     local goodName = goodDisplayName(good, removed)
     local sourceStationName = haul.source.name
-    owner:sendChatMessage("", ChatMessageType.Economy, "Picked up %1% units of %2% from %3%"%_T, removed, goodName, sourceStationName)
+    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% picked up %4% units of %5% from %6%."%_T,
+        haul.source.x, haul.source.y, self.shipName, removed, goodName, sourceStationName)
 
-    local t = haul.target
-    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, good, removed)
+    haul.carriedAmount = removed
+    self.data.phase = "haulingToTarget"
+    self.data.timer = 0
 end
 
 function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
@@ -563,10 +651,12 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     -- full delivery succeeded: log it and continue
     local goodName = goodDisplayName(good, added)
     local targetStationName = haul.target.name
-    owner:sendChatMessage("", ChatMessageType.Economy, "Delivered %1% units of %2% to %3%"%_T, added, goodName, targetStationName)
+    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% delivered %4% units of %5% to %6%."%_T,
+        haul.target.x, haul.target.y, self.shipName, added, goodName, targetStationName)
 
     local returnLeg = (haul and haul.travelTime) or 60
 
+    haul.carriedAmount = 0
     self.data.currentHaul = nil
     self.data.phase = "idle"
     self.data.rescanCooldown = returnLeg -- simulate the trip back before the next haul
@@ -879,10 +969,10 @@ local ferryReplyCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 
-function run(faction, shipName, nextX, nextY, useGate)
+function run(faction, shipName, nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
     for _, entity in pairs({Sector():getEntitiesByScriptValue("displayed_faction")}) do
         if entity:getValue("displayed_faction") == faction and entity.name == shipName then
-            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate)
+            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
         end
     end
 end
@@ -941,13 +1031,30 @@ function StockFactoryCommand:computeFerryNextHop(sx, sy)
     local anchor = self.data.anchor or {}
     local destX, destY
 
-    if sx == haul.target.x and sy == haul.target.y then
+    local phase = self.data.phase
+    if phase == "haulingToSource" or phase == "transactingPickup" then
         destX, destY = haul.source.x, haul.source.y
-    else
+    elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
         destX, destY = haul.target.x, haul.target.y
+    else
+        return nil, nil, false
     end
 
     return nextHopOnTree(cameFrom, anchor.x, anchor.y, sx, sy, destX, destY)
+end
+
+function StockFactoryCommand:getFerryDockTarget()
+    local haul = self.data.currentHaul
+    if not haul then return nil end
+
+    local phase = self.data.phase
+    if phase == "haulingToSource" or phase == "transactingPickup" then
+        return haul.source
+    elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
+        return haul.target
+    end
+
+    return nil
 end
 
 -- invoked by the ferry appearance to learn which gate to use; replies straight
@@ -957,9 +1064,15 @@ function StockFactoryCommand:onFerryRouteRequest(sx, sy)
     if not owner then return end
 
     local nextX, nextY, useGate = self:computeFerryNextHop(sx, sy)
+    local dockTarget = self:getFerryDockTarget()
 
     runSectorCode(sx, sy, true, ferryReplyCode, "run", owner.index, self.shipName,
-        nextX or 0, nextY or 0, useGate and true or false)
+        nextX or 0, nextY or 0, useGate and true or false,
+        dockTarget and (dockTarget.factionIndex or 0) or 0,
+        dockTarget and dockTarget.name or "",
+        dockTarget and dockTarget.x or 0,
+        dockTarget and dockTarget.y or 0,
+        dockTarget and true or false)
 end
 
 
@@ -1189,48 +1302,46 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     vlist:nextRect(4)
     ui.window:createLabel(vlist:nextRect(15), "Goods to keep stocked:"%_t, 12)
 
-    -- Select All / Clear buttons (with their own onclick handlers via closures)
+    -- scrollable goods list with row coloring for selection
+    -- use vlist to manage layout properly, allocate most space for goods list
+    local gridRect = vlist:nextRect(200)  -- take most remaining space
+    ui.goodsList = ui.window:createListBoxEx(gridRect)
+    ui.goodsList.columns = 1
+    ui.goodsList:setColumnWidth(0, gridRect.width)
+    ui.goodsList.entriesSelectable = true
+    ui._selectedGoods = {}
+    ui._previousGoods = {}
+    ui._configChangedCallbackName = configChangedCallback
+    ui._goodsCallback = configChangedCallback
+    ui.goodsList.onSelectFunction = configChangedCallback
+
+    -- Select All / Clear buttons below the scroll area, using vlist layout
     local buttonRect = vlist:nextRect(20)
     local buttonSplit = UIVerticalSplitter(buttonRect, 5, 0, 0.5)
     ui.selectAllButton = ui.window:createButton(buttonSplit.left, "Select All"%_t, "")
     ui.clearSelectionButton = ui.window:createButton(buttonSplit.right, "Clear Selection"%_t, "")
 
-    -- Store a reference to the mapcommands callback function for later invocation
-    ui._configChangedCallbackName = configChangedCallback
-
     -- Set up onclick handlers with closure access to ui state
     local selectAllCallback = function()
         for i = 0, ui.goodsList.rows - 1 do
-            local _, _, _, _, goodName = ui.goodsList:getEntry(1, i)
+            local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
             ui._selectedGoods[goodName] = true
-            ui.goodsList:setEntry(0, i, "checked", false, false, ColorRGB(1, 1, 1))
+            ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(1, 1, 1))
         end
         MapCommands[ui._configChangedCallbackName]()
     end
 
     local clearSelectionCallback = function()
         for i = 0, ui.goodsList.rows - 1 do
-            local _, _, _, _, goodName = ui.goodsList:getEntry(1, i)
+            local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
             ui._selectedGoods[goodName] = nil
-            ui.goodsList:setEntry(0, i, "", false, false, ColorRGB(1, 1, 1))
+            ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(0.65, 0.65, 0.65))
         end
         MapCommands[ui._configChangedCallbackName]()
     end
 
     ui.selectAllButton.onClickedFunction = selectAllCallback
     ui.clearSelectionButton.onClickedFunction = clearSelectionCallback
-
-    -- scrollable goods checklist with checkbox + label columns
-    local gridRect = vlist.inner
-    ui.goodsList = ui.window:createListBoxEx(gridRect)
-    ui.goodsList.columns = 2
-    ui.goodsList:setColumnWidth(0, 22)
-    ui.goodsList:setColumnWidth(1, gridRect.width - 22)
-    ui.goodsList.entriesSelectable = true
-    ui._selectedGoods = {}
-    ui._previousGoods = {}
-    ui._goodsCallback = configChangedCallback
-    ui.goodsList.onSelectFunction = configChangedCallback
 
     -- prediction panel
     local predictable = self:getPredictableValues()
@@ -1315,18 +1426,20 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             for _, goodName in pairs(inputGoods) do
                 self.goodsList:addRow(goodName)
                 local rowIdx = self.goodsList.rows - 1
-                self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
-                self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(1, 1, 1))
-                self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.9, 0.9, 0.9))
-                self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
+                local isSelected = self._selectedGoods[goodName]
+                local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
+                self.goodsList:setEntry(0, rowIdx, goodDisplayName(goodName, 2), false, false, color)
+                self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.Text)
+                self.goodsList:setColumnWidth(0, self.goodsList.width)
             end
             self.goodsList.onSelectFunction = self._goodsCallback
         else
             -- goods unchanged: just update checkbox states
             for i = 0, self.goodsList.rows - 1 do
-                local _, _, _, _, goodName = self.goodsList:getEntry(1, i)
+                local _, _, _, _, goodName = self.goodsList:getEntry(0, i)
                 local isSelected = self._selectedGoods[goodName]
-                self.goodsList:setEntry(0, i, isSelected and "checked" or "", false, false, ColorRGB(1, 1, 1))
+                local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
+                self.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, color)
             end
         end
     end
@@ -1367,11 +1480,13 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         local clicked = self.goodsList.selectedValue
         if clicked and clicked ~= "" then
             self._selectedGoods[clicked] = not self._selectedGoods[clicked]
-            -- update that row's checkbox immediately without rebuilding the entire list
+            -- update that row's color immediately without rebuilding the entire list
             for i = 0, self.goodsList.rows - 1 do
-                local _, _, _, _, goodName = self.goodsList:getEntry(1, i)
+                local _, _, _, _, goodName = self.goodsList:getEntry(0, i)
                 if goodName == clicked then
-                    self.goodsList:setEntry(0, i, self._selectedGoods[clicked] and "checked" or "", false, false, ColorRGB(1, 1, 1))
+                    local isSelected = self._selectedGoods[clicked]
+                    local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
+                    self.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, color)
                     break
                 end
             end
@@ -1396,10 +1511,9 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         for _, goodName in pairs(config.goods or {}) do
             self.goodsList:addRow(goodName)
             local rowIdx = self.goodsList.rows - 1
-            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
-            self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(0.5, 0.8, 0.5))
-            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.5, 0.8, 0.5))
-            self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
+            self.goodsList:setEntry(0, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.5, 0.8, 0.5))
+            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.Text)
+            self.goodsList:setColumnWidth(0, self.goodsList.width)
         end
     end
 

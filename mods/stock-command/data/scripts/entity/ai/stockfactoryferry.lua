@@ -44,6 +44,7 @@ local waitCount = 0
 local nextHop
 local nextHopReady = false
 local nextHopUseGate = false
+local dockTarget
 
 -- arrival bookkeeping: we hold at the spawn point for a moment so the route reply
 -- can arrive and we can enter from the correct gate
@@ -150,42 +151,59 @@ function initialize(faction)
 end
 
 -- called by the command (through the sector) with the next hop of our route
-function setNextHop(nextX, nextY, useGate)
+function setNextHop(nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
     nextHop = {x = nextX, y = nextY}
     nextHopUseGate = useGate and true or false
+
+    if hasDockTarget and dockName and dockName ~= "" then
+        dockTarget = {
+            factionIndex = dockFaction,
+            name = dockName,
+            x = dockX,
+            y = dockY,
+        }
+    else
+        dockTarget = nil
+    end
+
     nextHopReady = true
 end
 
 function secure()
-    return {stage = stage, waitCount = waitCount}
+    return {
+        stage = stage,
+        waitCount = waitCount,
+        nextHop = nextHop,
+        nextHopReady = nextHopReady,
+        nextHopUseGate = nextHopUseGate,
+        dockTarget = dockTarget,
+    }
 end
 
 function restore(values)
     values = values or {}
     stage = values.stage
     waitCount = values.waitCount or 0
+    nextHop = values.nextHop
+    nextHopReady = values.nextHopReady and true or false
+    nextHopUseGate = values.nextHopUseGate and true or false
+    dockTarget = values.dockTarget
 end
 
--- nearest station in the sector that belongs to the ferry's owner and can be
--- docked at
-local function findOwnedStation()
-    local ship = Entity()
-    local best, bestDist
+-- exact station for the current pickup/delivery leg, supplied by the command
+local function findDockTargetStation()
+    if not dockTarget then return end
 
-    for _, station in pairs({Sector():getEntitiesByType(EntityType.Station)}) do
-        if station.factionIndex == factionIndex then
-            local docks = DockingPositions(station)
-            if valid(docks) and docks.numDockingPositions > 0 and docks.docksEnabled then
-                local dist = distance(station.translationf, ship.translationf)
-                if not bestDist or dist < bestDist then
-                    best = station
-                    bestDist = dist
-                end
-            end
-        end
-    end
+    local sx, sy = Sector():getCoordinates()
+    if sx ~= dockTarget.x or sy ~= dockTarget.y then return end
 
-    return best
+    local station = Sector():getEntityByFactionAndName(dockTarget.factionIndex or factionIndex, dockTarget.name)
+    if not valid(station) then return end
+
+    local docks = DockingPositions(station)
+    if not valid(docks) or docks.numDockingPositions <= 0 or not docks.docksEnabled then return end
+
+    return station
 end
 
 -- ask the appearance system to jump the ferry back out of the sector
@@ -292,10 +310,13 @@ function updateServer(timeStep)
     if stationId then station = sector:getEntity(stationId) end
 
     if not valid(station) then
-        station = findOwnedStation()
+        station = findDockTargetStation()
         if not valid(station) then
-            -- nothing of ours to dock at here: just drift like other eye candy
-            ship:addScriptOnce("ai/patrolpeacefully.lua")
+            -- this sector is just a transit hop for the current leg
+            local gate, isJump = chosenGate(ship)
+            exitGateId = (gate and not isJump) and gate.id or nil
+            DockAI.reset()
+            stage = 3
             return
         end
         stationId = station.id
