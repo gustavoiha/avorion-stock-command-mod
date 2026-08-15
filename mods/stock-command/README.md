@@ -12,6 +12,19 @@ Stock Factory captain command mod for Avorion.
 - Moves goods only between your own stations, never hauling from a source
     station that also buys the same good.
 - Logs all cargo pickups and deliveries to the Economy chat channel for visibility.
+- **If cargo transfer fails (overflow, station destroyed, etc.), the command aborts and
+    returns the cargo to the player's control** instead of losing it.
+
+## Cargo Overflow Handling
+
+If either:
+- The destination station is too full to accept the cargo
+- The destination station is destroyed or inaccessible
+- The source station cannot provide the cargo
+
+Then the command **aborts immediately** and the player regains control of the ship with any cargo remaining in its hold. This ensures no cargo is ever lost silently. The player can then manually decide what to do with the remaining cargo.
+
+See `CARGO_OVERFLOW_HANDLING.md` for detailed behavior and setup recommendations.
 
 ## Folder contents
 

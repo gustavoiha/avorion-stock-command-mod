@@ -409,25 +409,6 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount)
 end
 ]]
 
-local retourCode = [[
-package.path = package.path .. ";data/scripts/lib/?.lua"
-include("goods")
-include("utility")
-
-function run(faction, shipName, stationFaction, stationName, goodName, amount)
-    local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) then return end
-
-    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
-    if not valid(station) then return end
-
-    local good = goods[goodName]
-    if not good then return end
-
-    CargoBay(station):addCargo(good:good(), amount)
-end
-]]
-
 function StockFactoryCommand:querySectors()
     local haul = self.data.currentHaul
     local t = haul and haul.target
@@ -543,9 +524,8 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
     if not haul then return end
 
     if (removed or 0) <= 0 then
-        self.data.currentHaul = nil
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 30
+        -- pickup failed: abort the command and return to player control with empty hold
+        self:setRuntimeError("Commander, I couldn't pick up cargo from %1%. Aborting the command."%_T, haul.source.name)
         return
     end
 
@@ -561,20 +541,29 @@ end
 function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     local owner = getParentFaction()
     local haul = self.data.currentHaul
+    if not haul then return end
 
-    -- log the delivery to economy chat
-    if haul and (added or 0) > 0 then
-        local goodName = goodDisplayName(good, added)
-        local targetStationName = haul.target.name
-        owner:sendChatMessage("", ChatMessageType.Economy, "Delivered %1% units of %2% to %3%"%_T, added, goodName, targetStationName)
+    local amountToDeliver = (added or 0) + (notAdded or 0)
+
+    -- if nothing was delivered at all, the station rejected the cargo (destroyed, full, etc.)
+    -- abort and return to player control with the full cargo load
+    if (added or 0) <= 0 then
+        self:setRuntimeError("Commander, the delivery to %1% failed. I'm aborting with the full cargo load. Please handle this manually."%_T, haul.target.name)
+        return
     end
 
-    -- if the target had less room than expected (e.g. another ship delivered in
-    -- the meantime), return the leftover goods to the source instead of losing them
-    if haul and (notAdded or 0) > 0 then
-        owner:sendChatMessage("", ChatMessageType.Economy, "Returned %1% units of %2% to %3% (target station was full)"%_T, notAdded, goodDisplayName(good, notAdded), haul.source.name)
-        runSectorCode(haul.source.x, haul.source.y, true, retourCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, notAdded)
+    -- if only part of the cargo fit (overflow due to other ships or station issue),
+    -- abort and return to player control with remaining cargo
+    if (notAdded or 0) > 0 then
+        local goodName = goodDisplayName(good, notAdded)
+        self:setRuntimeError("Commander, I could only deliver %1% of the %2% units to %3%. The station was full. I'm aborting with %4% units of cargo left in the hold."%_T, added, amountToDeliver, haul.target.name, notAdded)
+        return
     end
+
+    -- full delivery succeeded: log it and continue
+    local goodName = goodDisplayName(good, added)
+    local targetStationName = haul.target.name
+    owner:sendChatMessage("", ChatMessageType.Economy, "Delivered %1% units of %2% to %3%"%_T, added, goodName, targetStationName)
 
     local returnLeg = (haul and haul.travelTime) or 60
 
