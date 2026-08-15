@@ -1189,15 +1189,48 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     vlist:nextRect(4)
     ui.window:createLabel(vlist:nextRect(15), "Goods to keep stocked:"%_t, 12)
 
-    -- scrollable goods checklist
+    -- Select All / Clear buttons (with their own onclick handlers via closures)
+    local buttonRect = vlist:nextRect(20)
+    local buttonSplit = UIVerticalSplitter(buttonRect, 5, 0, 0.5)
+    ui.selectAllButton = ui.window:createButton(buttonSplit.left, "Select All"%_t, "")
+    ui.clearSelectionButton = ui.window:createButton(buttonSplit.right, "Clear Selection"%_t, "")
+
+    -- Store a reference to the mapcommands callback function for later invocation
+    ui._configChangedCallbackName = configChangedCallback
+
+    -- Set up onclick handlers with closure access to ui state
+    local selectAllCallback = function()
+        for i = 0, ui.goodsList.rows - 1 do
+            local _, _, _, _, goodName = ui.goodsList:getEntry(1, i)
+            ui._selectedGoods[goodName] = true
+            ui.goodsList:setEntry(0, i, "checked", false, false, ColorRGB(1, 1, 1))
+        end
+        MapCommands[ui._configChangedCallbackName]()
+    end
+
+    local clearSelectionCallback = function()
+        for i = 0, ui.goodsList.rows - 1 do
+            local _, _, _, _, goodName = ui.goodsList:getEntry(1, i)
+            ui._selectedGoods[goodName] = nil
+            ui.goodsList:setEntry(0, i, "", false, false, ColorRGB(1, 1, 1))
+        end
+        MapCommands[ui._configChangedCallbackName]()
+    end
+
+    ui.selectAllButton.onClickedFunction = selectAllCallback
+    ui.clearSelectionButton.onClickedFunction = clearSelectionCallback
+
+    -- scrollable goods checklist with checkbox + label columns
     local gridRect = vlist.inner
     ui.goodsList = ui.window:createListBoxEx(gridRect)
     ui.goodsList.columns = 2
     ui.goodsList:setColumnWidth(0, 22)
     ui.goodsList:setColumnWidth(1, gridRect.width - 22)
-    ui.goodsList.entriesSelectable = false
+    ui.goodsList.entriesSelectable = true
+    ui._selectedGoods = {}
+    ui._previousGoods = {}
     ui._goodsCallback = configChangedCallback
-    ui.goodsList.onChangedFunction = configChangedCallback
+    ui.goodsList.onSelectFunction = configChangedCallback
 
     -- prediction panel
     local predictable = self:getPredictableValues()
@@ -1237,8 +1270,10 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.clear = function(self, shipName)
         self.commonUI:clear(shipName)
         self.anchorSectorLabel.caption = ""
-        self.goodsList.onChangedFunction = ""
+        self.goodsList.onSelectFunction = ""
         self.goodsList:clear()
+        self._selectedGoods = {}
+        self._previousGoods = {}
     end
 
     -- fills the goods checklist from all owned stations in the selected
@@ -1252,26 +1287,48 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             self.anchorSectorLabel.caption = ""
         end
 
-        -- remember checked goods before rebuilding
-        local checked = {}
-        for i = 0, self.goodsList.rows - 1 do
-            local checkedState, _, _, _, goodName = self.goodsList:getEntry(0, i)
-            if checkedState ~= "" then checked[goodName] = true end
-        end
-
         local inputGoods = anchorRegionGoods(stations)
 
-        self.goodsList.onChangedFunction = ""  -- suspend callback during rebuild
-        self.goodsList:clear()
-        for _, goodName in pairs(inputGoods) do
-            self.goodsList:addRow(goodName)
-            local rowIdx = self.goodsList.rows - 1
-            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
-            self.goodsList:setEntry(0, rowIdx, checked[goodName] and "checked" or "", false, false, ColorRGB(1, 1, 1))
-            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.9, 0.9, 0.9))
-            self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
+        -- only rebuild list if goods changed (area selection changed); otherwise just update checkbox states
+        local goodsChanged = #inputGoods ~= #self._previousGoods
+        if not goodsChanged then
+            for i, g in pairs(inputGoods) do
+                if self._previousGoods[i] ~= g then
+                    goodsChanged = true
+                    break
+                end
+            end
         end
-        self.goodsList.onChangedFunction = self._goodsCallback
+
+        if goodsChanged then
+            -- goods list changed: rebuild and select all by default
+            self._previousGoods = {}
+            for _, g in pairs(inputGoods) do table.insert(self._previousGoods, g) end
+
+            -- first time: auto-select all goods
+            for _, g in pairs(inputGoods) do
+                self._selectedGoods[g] = true
+            end
+
+            self.goodsList.onSelectFunction = ""  -- suspend callback during rebuild
+            self.goodsList:clear()
+            for _, goodName in pairs(inputGoods) do
+                self.goodsList:addRow(goodName)
+                local rowIdx = self.goodsList.rows - 1
+                self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
+                self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(1, 1, 1))
+                self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.9, 0.9, 0.9))
+                self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
+            end
+            self.goodsList.onSelectFunction = self._goodsCallback
+        else
+            -- goods unchanged: just update checkbox states
+            for i = 0, self.goodsList.rows - 1 do
+                local _, _, _, _, goodName = self.goodsList:getEntry(1, i)
+                local isSelected = self._selectedGoods[goodName]
+                self.goodsList:setEntry(0, i, isSelected and "checked" or "", false, false, ColorRGB(1, 1, 1))
+            end
+        end
     end
 
     ui.refresh = function(self, ownerIndex, shipName, area, config)
@@ -1306,37 +1363,52 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     end
 
     ui.buildConfig = function(self)
-        local config = {}
-        config.escorts = self.commonUI.escortUI:buildConfig()
-        config.goods = {}
-
-        for i = 0, self.goodsList.rows - 1 do
-            local checkedState, _, _, _, goodName = self.goodsList:getEntry(0, i)
-            if checkedState ~= "" then
-                table.insert(config.goods, goodName)
+        -- toggle the good whose row was just clicked (selectedValue is set by the engine before the callback fires)
+        local clicked = self.goodsList.selectedValue
+        if clicked and clicked ~= "" then
+            self._selectedGoods[clicked] = not self._selectedGoods[clicked]
+            -- update that row's checkbox immediately without rebuilding the entire list
+            for i = 0, self.goodsList.rows - 1 do
+                local _, _, _, _, goodName = self.goodsList:getEntry(1, i)
+                if goodName == clicked then
+                    self.goodsList:setEntry(0, i, self._selectedGoods[clicked] and "checked" or "", false, false, ColorRGB(1, 1, 1))
+                    break
+                end
             end
         end
 
+        local config = {}
+        config.escorts = self.commonUI.escortUI:buildConfig()
+        config.goods = {}
+        for good, _ in pairs(self._selectedGoods) do
+            table.insert(config.goods, good)
+        end
         return config
     end
 
     ui.displayConfig = function(self, config, ownerIndex)
         -- read-only display of a running command
-        self.goodsList.onChangedFunction = ""
+        self.goodsList.onSelectFunction = ""
+        self.goodsList.entriesSelectable = false
+        self.selectAllButton.active = false
+        self.clearSelectionButton.active = false
         self.goodsList:clear()
         for _, goodName in pairs(config.goods or {}) do
             self.goodsList:addRow(goodName)
             local rowIdx = self.goodsList.rows - 1
             self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.CheckBox)
-            self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(0.7, 0.7, 0.7))
-            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.7, 0.7, 0.7))
+            self.goodsList:setEntry(0, rowIdx, "checked", false, false, ColorRGB(0.5, 0.8, 0.5))
+            self.goodsList:setEntry(1, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.5, 0.8, 0.5))
             self.goodsList:setEntryType(1, rowIdx, ListBoxEntryType.Text)
         end
     end
 
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
-        self.goodsList.onChangedFunction = active and self._goodsCallback or ""
+        self.goodsList.entriesSelectable = active
+        self.goodsList.onSelectFunction = active and self._goodsCallback or ""
+        self.selectAllButton.active = active
+        self.clearSelectionButton.active = active
     end
 
     ui.onWindowClosed = function(self)
