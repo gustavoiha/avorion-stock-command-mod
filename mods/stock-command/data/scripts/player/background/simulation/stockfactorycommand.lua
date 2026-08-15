@@ -19,7 +19,7 @@ StockFactoryCommand.type = CommandType.StockFactory
 local MaxGoodCheckboxes = 20
 
 -- anchor-sector operating radius over the gate network
-local MaxGateJumps = 3
+local MaxGateJumps = 5
 
 -- suppliers are reached purely through the gate network; cycle time is modelled
 -- per gate jump between the target and the supplier, plus a fixed docking overhead
@@ -549,6 +549,11 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
         return
     end
 
+    -- log the pickup to economy chat
+    local goodName = goodDisplayName(good, removed)
+    local sourceStationName = haul.source.name
+    owner:sendChatMessage("", ChatMessageType.Economy, "Picked up %1% units of %2% from %3%"%_T, removed, goodName, sourceStationName)
+
     local t = haul.target
     runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, good, removed)
 end
@@ -557,9 +562,17 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     local owner = getParentFaction()
     local haul = self.data.currentHaul
 
+    -- log the delivery to economy chat
+    if haul and (added or 0) > 0 then
+        local goodName = goodDisplayName(good, added)
+        local targetStationName = haul.target.name
+        owner:sendChatMessage("", ChatMessageType.Economy, "Delivered %1% units of %2% to %3%"%_T, added, goodName, targetStationName)
+    end
+
     -- if the target had less room than expected (e.g. another ship delivered in
     -- the meantime), return the leftover goods to the source instead of losing them
     if haul and (notAdded or 0) > 0 then
+        owner:sendChatMessage("", ChatMessageType.Economy, "Returned %1% units of %2% to %3% (target station was full)"%_T, notAdded, goodDisplayName(good, notAdded), haul.source.name)
         runSectorCode(haul.source.x, haul.source.y, true, retourCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, notAdded)
     end
 
@@ -961,7 +974,7 @@ function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
     local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
 
     if prediction.numGoodsWithSource == 0 then
-        return "No producer/consumer station pairs for the selected goods were found in the anchor region (up to 3 gate jumps)."%_t
+        return "No producer/consumer station pairs for the selected goods were found in the anchor region (up to 5 gate jumps)."%_t
     end
 
     return
@@ -1116,7 +1129,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.fontColor = ColorRGB(0.7, 0.7, 0.7)
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
-        "Anchors to one sector and operates in that sector plus sectors up to 3 gate jumps away."%_t .. "\n\n" ..
+        "Anchors to one sector and operates in that sector plus sectors up to 5 gate jumps away."%_t .. "\n\n" ..
         "The ship ferries only the goods you select, moving them between your own producer and consumer stations in that anchor region."%_t .. "\n\n" ..
         "It never hauls more than a consumer station needs, and never takes a good from a station that also buys it."%_t
 
