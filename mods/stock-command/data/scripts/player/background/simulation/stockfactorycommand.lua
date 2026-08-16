@@ -1403,7 +1403,7 @@ end
 function StockFactoryCommand:getDescriptionText()
     local anchor = self.data and self.data.anchor
     if anchor then
-        return "The ship is stocking your stations in the anchor region around \\s(${x}:${y}), moving all eligible goods between your own producers and consumers (except any you have added to the ignore list)."%_T, {x = anchor.x, y = anchor.y}
+        return "The ship is stocking your stations in the anchor region around (${x}:${y}), moving all eligible goods between your own producers and consumers (except any you have added to the ignore list)."%_T, {x = anchor.x, y = anchor.y}
     end
 
     return "The ship is stocking your stations in the anchor region, moving all eligible goods between your own producers and consumers."%_T
@@ -1699,7 +1699,8 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
         self.currentArea = area
         local ax, ay = areaAnchor(area)
         if ax then
-            self.anchorSectorLabel.caption = "\\s(" .. ax .. ":" .. ay .. ")"
+            -- \s(x:y) is chat/description markup; a Label renders it literally
+            self.anchorSectorLabel.caption = "(" .. ax .. ":" .. ay .. ")"
         else
             self.anchorSectorLabel.caption = ""
         end
