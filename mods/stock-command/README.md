@@ -7,24 +7,43 @@ Stock Factory captain command mod for Avorion.
 - Anchors the Stock Factory command to a selected sector.
 - Operates on player/alliance-owned stations in the anchor sector and sectors
     connected by gates up to 5 jumps away.
-- Lets you choose which goods to haul from all goods your stations in that
-    region either consume or produce.
+- Hauls every eligible good by default. The command window provides an ignore
+    list for goods that should not be moved.
 - Moves goods only between your own stations, never hauling from a source
     station that also buys the same good.
+- Requires the initiating player to have the alliance `Manage Stations`
+    privilege before alliance station cargo or stock-hauler settings can be
+    changed.
 - Logs all cargo pickups and deliveries to the Economy chat channel for visibility.
-- **If cargo transfer fails (overflow, station destroyed, etc.), the command aborts and
-    returns the cargo to the player's control** instead of losing it.
+- Stores picked-up goods in the background ship's real cargo hold. If delivery
+    fails, the command aborts and returns the ship with its remaining cargo.
 
 ## Cargo Overflow Handling
 
-If either:
-- The destination station is too full to accept the cargo
-- The destination station is destroyed or inaccessible
-- The source station cannot provide the cargo
+Pickup and delivery are separate, correlated transactions. A pickup is only
+acknowledged after the goods have been written to the ship's database cargo.
+Delivery removes only the amount actually accepted by the destination.
 
-Then the command **aborts immediately** and the player regains control of the ship with any cargo remaining in its hold. This ensures no cargo is ever lost silently. The player can then manually decide what to do with the remaining cargo.
+The command aborts and recalls the ship when:
 
-See `CARGO_OVERFLOW_HANDLING.md` for detailed behavior and setup recommendations.
+- A destination cannot accept all cargo.
+- A source or destination disappears or becomes inaccessible.
+- A station-management permission is revoked while the route is active.
+- An asynchronous station transfer times out repeatedly.
+- A five-minute route remap finds no consumer or eligible supplier.
+
+Any undelivered goods remain in the ship's cargo hold for the player to handle.
+
+An empty producer is not a failure: the command simply waits and tries another
+eligible route. A producer that is *destroyed*, sold, or opted out is different —
+it disappears from the route map, so if it was the last one the next five-minute
+remap recalls the ship rather than leaving it idle forever.
+
+A stalled station transfer is retried rather than aborted. Because the ship's real
+cargo is the source of truth and every transfer clamps to it, replaying a leg cannot
+duplicate goods; only repeated timeouts recall the ship. For the same reason, a
+transfer interrupted by a server restart is replayed on load instead of stranding
+the command.
 
 ## Folder contents
 

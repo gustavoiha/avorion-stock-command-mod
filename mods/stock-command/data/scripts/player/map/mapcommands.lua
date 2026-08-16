@@ -26,6 +26,18 @@ do
                     return realSort(t)
                 end
 
+                local sortsStockFactoryCommands = false
+                for _, value in pairs(t) do
+                    if value == CommandType.StockFactory then
+                        sortsStockFactoryCommands = true
+                        break
+                    end
+                end
+
+                if not sortsStockFactoryCommands then
+                    return realSort(t, cmp)
+                end
+
                 local safeCmp = function(a, b)
                     local ok, result = pcall(cmp, a, b)
                     if ok then return result end

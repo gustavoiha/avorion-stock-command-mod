@@ -6,6 +6,7 @@ local SimulationUtility = include ("simulationutility")
 local CaptainUtility = include ("captainutility")
 local TradingUtility = include ("tradingutility")
 local GatesMap = include ("gatesmap")
+local StockFactoryUtility = include ("stockfactoryutility")
 include ("utility")
 include ("stringutility")
 include ("goods")
@@ -28,6 +29,16 @@ local MaxReachableSectors = 400
 
 -- how often (seconds) the command re-scans reachable suppliers and the gate route
 local RemapInterval = 5 * 60
+local CommandLeaseKey = "stock_factory_command_lease"
+
+-- how long to wait for an asynchronous sector transfer before replaying the leg,
+-- and how many replays to allow before giving up and recalling
+local TransactionTimeout = 300
+local MaxTransactionTimeouts = 2
+
+-- a committing transfer only blocks recall for this long, so a lost sector reply can
+-- never strand the ship (Simulation.forceRecall silently aborts on a recall error)
+local RecallBlockSeconds = 30
 
 
 ---------------------------------------------------------------------
@@ -42,8 +53,26 @@ local function isGoodEligible(name)
     return true
 end
 
+local function isGoodIgnored(config, name)
+    return config and type(config.ignoredGoods) == "table" and config.ignoredGoods[name] == true
+end
+
 local function skey(x, y)
     return x .. ":" .. y
+end
+
+-- all eligible goods present across any station in the list (union of buys and sells)
+local function allStationGoods(stations)
+    local result = {}
+    for _, st in pairs(stations or {}) do
+        for good, _ in pairs(st.buys or {}) do
+            if not result[good] and isGoodEligible(good) then result[good] = true end
+        end
+        for good, _ in pairs(st.sells or {}) do
+            if not result[good] and isGoodEligible(good) then result[good] = true end
+        end
+    end
+    return result
 end
 
 local function goodDisplayName(name, amount)
@@ -61,6 +90,13 @@ local function areaAnchor(area)
     end
 end
 
+local function clearCommandLease(ownerIndex, shipName, commandToken)
+    local entry = ShipDatabaseEntry(ownerIndex, shipName)
+    if valid(entry) and entry:getScriptValue(CommandLeaseKey) == commandToken then
+        entry:setScriptValue(CommandLeaseKey, nil)
+    end
+end
+
 
 ---------------------------------------------------------------------
 -- construction
@@ -69,6 +105,9 @@ end
 -- all commands need this kind of "new" to function within the bg simulation framework
 -- it must be possible to call the command without any parameters to access some functionality
 local function new(ship, area, config)
+    config = config or {}
+    if type(config.ignoredGoods) ~= "table" then config.ignoredGoods = {} end
+
     local command = setmetatable({
         type = CommandType.StockFactory,
         shipName = ship,
@@ -97,10 +136,6 @@ end
 ---------------------------------------------------------------------
 
 function StockFactoryCommand:initialize()
-    if not self.config.goods or #self.config.goods == 0 then
-        return "We need at least one good to stock."%_T
-    end
-
     local ax = areaAnchor(self.area)
     if not ax then
         return "We need an anchor sector."%_T
@@ -123,14 +158,21 @@ function StockFactoryCommand:onStart()
     self.data.gateCameFrom = analysis.gateCameFrom or {}
     self.data.gateDepth = analysis.gateDepth or {}
     self.data.callingPlayer = analysis.callingPlayer
+    self.config = self.config or {}
+    self.config.ignoredGoods = self.config.ignoredGoods or {}
 
     self.data.phase = "idle"
     self.data.timer = 0
     self.data.rescanCooldown = 0
     self.data.remapCooldown = RemapInterval
+    self.data.nextTransactionId = 0
+    self.data.transaction = nil
+    self.data.transactionProtocolVersion = 2
+    self.data.commandToken = tostring(random():createSeed()) .. ":" .. tostring(random():createSeed())
 
     local owner = getParentFaction()
     local entry = ShipDatabaseEntry(owner.index, self.shipName)
+    entry:setScriptValue(CommandLeaseKey, self.data.commandToken)
     entry:setStatusMessage("Stocking a sector"%_T)
 end
 
@@ -188,26 +230,88 @@ function StockFactoryCommand:update(timeStep)
 
     elseif phase == "transactingPickup" or phase == "transactingDelivery" then
         -- waiting for the asynchronous sector probes / transfers to report back.
-        -- if they never do (e.g. a sector got unloaded), recover after a while.
-        if self.data.timer >= 300 then
-            self.transaction = nil
-            self.data.currentHaul = nil
-            self.data.phase = "idle"
-            self.data.rescanCooldown = 30
+        -- The ship's real cargo is the source of truth and every transfer clamps to it,
+        -- so replaying the leg can't duplicate goods. Only give up after repeated timeouts.
+        if self.data.timer >= TransactionTimeout then
+            self.data.transactionTimeouts = (self.data.transactionTimeouts or 0) + 1
+
+            if self.data.transactionTimeouts > MaxTransactionTimeouts then
+                self:setRuntimeError("Commander, the stock transfer keeps timing out. I'm aborting with any collected cargo still in the hold."%_T)
+                return
+            end
+
+            self:rewindPendingTransaction()
         end
     end
 end
 
+-- Drops an in-flight transaction and rewinds to the travel leg that issued it. Used when a
+-- queued runSectorCode job can no longer answer -- it timed out, or the server restarted and
+-- took the queue with it. Nothing is lost: the cargo already moved is on the ship, and the
+-- replayed transfer clamps to the ship's real cargo and free space.
+function StockFactoryCommand:rewindPendingTransaction()
+    if not self.data.transaction then return end
+
+    self.data.transaction = nil
+    self.data.probeRetries = 0
+    self.data.timer = 0
+
+    local phase = self.data.phase
+    if phase == "transactingPickup" then
+        self.data.phase = self.data.currentHaul and "haulingToSource" or "idle"
+    elseif phase == "transactingDelivery" then
+        self.data.phase = self.data.currentHaul and "haulingToTarget" or "idle"
+    end
+end
+
 function StockFactoryCommand:onRecall()
+    self.data.transaction = nil
+    local owner = getParentFaction()
+    clearCommandLease(owner.index, self.shipName, self.data.commandToken)
 end
 
 function StockFactoryCommand:onFinish()
+    self.data.transaction = nil
+    local owner = getParentFaction()
+    clearCommandLease(owner.index, self.shipName, self.data.commandToken)
 end
 
 function StockFactoryCommand:onSecure()
 end
 
 function StockFactoryCommand:onRestore()
+    self.config = self.config or {}
+    if type(self.config.ignoredGoods) ~= "table" then self.config.ignoredGoods = {} end
+    self.data.nextTransactionId = self.data.nextTransactionId or 0
+
+    if self.data.transactionProtocolVersion == 2 and self.data.commandToken then
+        local owner = getParentFaction()
+        local entry = ShipDatabaseEntry(owner.index, self.shipName)
+        if valid(entry) then entry:setScriptValue(CommandLeaseKey, self.data.commandToken) end
+
+        -- queued sector jobs don't survive a restart, so an in-flight transfer would
+        -- otherwise sit until it times out and recall a perfectly healthy command
+        self.data.transactionTimeouts = 0
+        self:rewindPendingTransaction()
+        return
+    end
+
+    local haul = self.data.currentHaul
+    local amount = haul and (haul.carriedAmount or 0) or 0
+    self.data.transaction = nil
+    self.data.transactionProtocolVersion = 2
+
+    if amount > 0 and not haul.cargoOnShip then
+        local owner = getParentFaction()
+        local entry = ShipDatabaseEntry(owner.index, self.shipName)
+        if valid(entry) then
+            entry:setScriptValue("stock_factory_pending_cargo_good", haul.good)
+            entry:setScriptValue("stock_factory_pending_cargo_amount", amount)
+            entry:addScriptOnce("data/scripts/entity/utility/stockfactorycargorecovery.lua")
+        end
+    end
+
+    self:setRuntimeError("Commander, this Stock Factory command used an older transfer protocol. I'm recalling so its cargo state can be verified safely."%_T)
 end
 
 function StockFactoryCommand:onAttacked(attackerFaction, x, y)
@@ -219,12 +323,15 @@ end
 -- ferry planning
 ---------------------------------------------------------------------
 
--- stations in the anchor region that consume the good
+-- stations in the anchor region that consume the good and allow stock-hauler delivery
 function StockFactoryCommand:eligibleTargets(good)
     local result = {}
 
+    if isGoodIgnored(self.config, good) then return result end
+
     for _, st in pairs(self.data.stations or {}) do
-        if st.buys and st.buys[good] then
+        if st.buys and st.buys[good]
+            and st.stockHaulerDeliveryEnabled ~= false then
             table.insert(result, st)
         end
     end
@@ -236,13 +343,17 @@ end
 --  - different station than the consumer
 --  - sell the good
 --  - do not also buy the same good (prevents internal starvation/loops)
+--  - not opted out of stock-hauler pickup
 function StockFactoryCommand:eligibleSources(good, target)
     local result = {}
+
+    if isGoodIgnored(self.config, good) then return result end
 
     for _, st in pairs(self.data.stations or {}) do
         if not (st.name == target.name and st.factionIndex == target.factionIndex)
             and st.sells and st.sells[good]
-            and not (st.buys and st.buys[good]) then
+            and not (st.buys and st.buys[good])
+            and st.stockHaulerPickupEnabled ~= false then
             table.insert(result, st)
         end
     end
@@ -262,25 +373,17 @@ function StockFactoryCommand:estimateTravelTime(source, target)
 end
 
 function StockFactoryCommand:planNextHaul()
-    local goodsList = self.config.goods or {}
-    if #goodsList == 0 then
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 120
-        return
-    end
-
-    -- Build all valid source/target pairs for selected goods and choose one at
+    -- Build all valid source/target pairs for all eligible goods and choose one at
     -- random so the route order is not predictable (not alphabetical/rotational).
     local candidates = {}
 
-    for _, good in pairs(goodsList) do
-        if isGoodEligible(good) then
-            local targets = self:eligibleTargets(good)
-            for _, target in pairs(targets) do
-                local sources = self:eligibleSources(good, target)
-                for _, source in pairs(sources) do
-                    table.insert(candidates, {good = good, source = source, target = target})
-                end
+    local goodsInStations = allStationGoods(self.data.stations)
+    for good, _ in pairs(goodsInStations) do
+        local targets = self:eligibleTargets(good)
+        for _, target in pairs(targets) do
+            local sources = self:eligibleSources(good, target)
+            for _, source in pairs(sources) do
+                table.insert(candidates, {good = good, source = source, target = target})
             end
         end
     end
@@ -332,49 +435,69 @@ local probeCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 include("stringutility")
+local StockFactoryUtility = include("stockfactoryutility")
 
-function run(faction, shipName, stationFaction, stationName, script, goodName, callback)
+function run(faction, shipName, stationFaction, stationName, script, goodName, callback, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end -- command will be cancelled anyway
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
+
+    local owner = Galaxy():findFaction(faction)
+    if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, I no longer have permission to manage station '%s'."%_T, stationName)
+        return
+    end
 
     local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, station '%s' has disappeared!"%_T, stationName)
         return
     end
 
     local callError, stock, maxStock = station:invokeFunction(script, "getStock", goodName)
     if callError ~= 0 then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, goodName, 0, 0)
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, 0, 0)
         return
     end
 
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, goodName, stock, maxStock)
+    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, stock, maxStock)
 end
 ]]
 
 local removeCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
+include("goods")
 include("utility")
 include("stringutility")
+local StockFactoryUtility = include("stockfactoryutility")
 
-function run(faction, shipName, stationFaction, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
 
-    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
-    if not valid(station) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
+    local owner = Galaxy():findFaction(faction)
+    if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, I no longer have permission to manage station '%s'."%_T, stationName)
         return
     end
 
-    local cargoBay = CargoBay(station)
-    local before = cargoBay:getNumCargos(goodName)
-    cargoBay:removeCargo(goodName, amount)
-    local after = cargoBay:getNumCargos(goodName)
-    local removed = before - after
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
+    if not valid(station) then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, station '%s' has disappeared!"%_T, stationName)
+        return
+    end
 
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsRemoved", goodName, removed)
+    local good = goods[goodName]
+    if not good then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, the cargo type for '%s' is no longer available."%_T, goodName)
+        return
+    end
+
+    amount = math.min(amount, math.floor(ship:getFreeCargoSpace() / math.max(good.size or 1, 0.0001)))
+    local removed = StockFactoryUtility.transferToShip(CargoBay(station), ship, good:good(), amount)
+
+    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsRemoved", commandToken, transactionId, goodName, removed)
 end
 ]]
 
@@ -383,28 +506,34 @@ package.path = package.path .. ";data/scripts/lib/?.lua"
 include("goods")
 include("utility")
 include("stringutility")
+local StockFactoryUtility = include("stockfactoryutility")
 
-function run(faction, shipName, stationFaction, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
     if not valid(ship) then return end
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
+
+    local owner = Galaxy():findFaction(faction)
+    if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, I no longer have permission to manage station '%s'."%_T, stationName)
+        return
+    end
 
     local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     if not valid(station) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", "Commander, station '%s' has disappeared!"%_T, stationName)
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, station '%s' has disappeared!"%_T, stationName)
         return
     end
 
     local good = goods[goodName]
-    if not good then return end
+    if not good then
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, the cargo type for '%s' is no longer available."%_T, goodName)
+        return
+    end
 
-    local cargoBay = CargoBay(station)
-    local before = cargoBay:getNumCargos(goodName)
-    cargoBay:addCargo(good:good(), amount)
-    local after = cargoBay:getNumCargos(goodName)
-    local added = after - before
-    local notAdded = amount - added
+    local added, notAdded = StockFactoryUtility.transferToStation(CargoBay(station), ship, good:good(), amount)
 
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsDelivered", goodName, added, notAdded)
+    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsDelivered", commandToken, transactionId, goodName, added, notAdded)
 end
 ]]
 
@@ -437,6 +566,12 @@ function StockFactoryCommand:beginPickupTransaction()
     local t = haul.target
     local s = haul.source
 
+    if not StockFactoryUtility.canUseStation(owner, t.factionIndex, self.data.callingPlayer)
+        or not StockFactoryUtility.canUseStation(owner, s.factionIndex, self.data.callingPlayer) then
+        self:setRuntimeError("Commander, I no longer have permission to manage one of the stations on this route."%_T)
+        return
+    end
+
     if not t.script or not s.script then
         -- we don't know which scripts trade the good; skip this haul
         self.data.currentHaul = nil
@@ -458,8 +593,11 @@ function StockFactoryCommand:beginPickupTransaction()
     end
     self.data.probeRetries = 0
 
-    -- transient (never saved to database on purpose)
-    self.transaction = {
+    self.data.nextTransactionId = (self.data.nextTransactionId or 0) + 1
+    local transactionId = self.data.nextTransactionId
+    self.data.transaction = {
+        id = transactionId,
+        stage = "probing",
         good = haul.good,
         targetReceived = false,
         sourceReceived = false,
@@ -467,8 +605,8 @@ function StockFactoryCommand:beginPickupTransaction()
         sourceStock = 0,
     }
 
-    runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock")
-    runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock")
+    runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock", self.data.commandToken, transactionId, self.data.callingPlayer)
+    runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock", self.data.commandToken, transactionId, self.data.callingPlayer)
 
     self.data.phase = "transactingPickup"
     self.data.timer = 0
@@ -487,49 +625,57 @@ function StockFactoryCommand:beginDeliveryTransaction()
         return
     end
 
+    if not StockFactoryUtility.canUseStation(owner, haul.target.factionIndex, self.data.callingPlayer) then
+        self:setRuntimeError("Commander, I no longer have permission to manage the destination station. I'm aborting with the collected cargo still in the hold."%_T)
+        return
+    end
+
     if not self:querySectors(false, true) then
         self.data.probeRetries = (self.data.probeRetries or 0) + 1
         if self.data.probeRetries > 15 then
             self.data.probeRetries = 0
-            self.data.currentHaul = nil
-            self.data.phase = "idle"
-            self.data.rescanCooldown = 60
+            self:setRuntimeError("Commander, I couldn't load the destination sector. I'm aborting with the collected cargo still in the hold."%_T)
         end
         return
     end
     self.data.probeRetries = 0
 
     local t = haul.target
-    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, haul.good, amount)
+    self.data.nextTransactionId = (self.data.nextTransactionId or 0) + 1
+    local transactionId = self.data.nextTransactionId
+    self.data.transaction = {id = transactionId, stage = "delivering", good = haul.good, amount = amount}
+    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, haul.good, amount, self.data.commandToken, transactionId, self.data.callingPlayer)
 
     self.data.phase = "transactingDelivery"
     self.data.timer = 0
 end
 
-function StockFactoryCommand:reportTargetStock(good, stock, maxStock)
-    if not self.transaction then return end
-    self.transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
-    self.transaction.targetReceived = true
+function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock)
+    local transaction = self.data.transaction
+    if self.data.commandToken ~= commandToken or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "probing" then return end
+    transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
+    transaction.targetReceived = true
 
     self:tryExecuteHaul()
 end
 
-function StockFactoryCommand:reportSourceStock(good, stock, maxStock)
-    if not self.transaction then return end
-    self.transaction.sourceStock = stock or 0
-    self.transaction.sourceReceived = true
+function StockFactoryCommand:reportSourceStock(commandToken, transactionId, good, stock, maxStock)
+    local transaction = self.data.transaction
+    if self.data.commandToken ~= commandToken or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "probing" then return end
+    transaction.sourceStock = stock or 0
+    transaction.sourceReceived = true
 
     self:tryExecuteHaul()
 end
 
 function StockFactoryCommand:tryExecuteHaul()
-    local tr = self.transaction
+    local tr = self.data.transaction
     if not tr or not tr.targetReceived or not tr.sourceReceived then return end
 
     local owner = getParentFaction()
     local haul = self.data.currentHaul
     if not haul then
-        self.transaction = nil
+        self.data.transaction = nil
         return
     end
 
@@ -546,24 +692,29 @@ function StockFactoryCommand:tryExecuteHaul()
     -- than the source has, and never more than the ship can carry
     local amount = math.min(tr.targetRoom, tr.sourceStock, cargoUnits)
 
-    self.transaction = nil
-
     if not amount or amount <= 0 then
         -- source has no stock yet, or consumer is already full
         -- try a new random pair soon instead of cycling deterministically
         self.data.currentHaul = nil
+        self.data.transaction = nil
         self.data.phase = "idle"
         self.data.rescanCooldown = 5
         return
     end
 
-    runSectorCode(haul.source.x, haul.source.y, true, removeCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, amount)
+    tr.stage = "removing"
+    tr.amount = amount
+    runSectorCode(haul.source.x, haul.source.y, true, removeCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, amount, self.data.commandToken, tr.id, self.data.callingPlayer)
 end
 
-function StockFactoryCommand:onGoodsRemoved(good, removed)
+function StockFactoryCommand:onGoodsRemoved(commandToken, transactionId, good, removed)
     local owner = getParentFaction()
     local haul = self.data.currentHaul
-    if not haul then return end
+    local transaction = self.data.transaction
+    if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "removing" then return end
+
+    self.data.transaction = nil
+    self.data.transactionTimeouts = 0
 
     if (removed or 0) <= 0 then
         -- source was empty at pickup time (produced nothing yet)
@@ -581,16 +732,22 @@ function StockFactoryCommand:onGoodsRemoved(good, removed)
         haul.source.x, haul.source.y, self.shipName, removed, goodName, sourceStationName)
 
     haul.carriedAmount = removed
+    haul.cargoOnShip = true
     self.data.phase = "haulingToTarget"
     self.data.timer = 0
 end
 
-function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
+function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good, added, notAdded)
     local owner = getParentFaction()
     local haul = self.data.currentHaul
-    if not haul then return end
+    local transaction = self.data.transaction
+    if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "delivering" then return end
+
+    self.data.transaction = nil
+    self.data.transactionTimeouts = 0
 
     local amountToDeliver = (added or 0) + (notAdded or 0)
+    haul.carriedAmount = notAdded or 0
 
     -- if nothing was delivered at all, the station rejected the cargo (destroyed, full, etc.)
     -- abort and return to player control with the full cargo load
@@ -602,7 +759,6 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     -- if only part of the cargo fit (overflow due to other ships or station issue),
     -- abort and return to player control with remaining cargo
     if (notAdded or 0) > 0 then
-        local goodName = goodDisplayName(good, notAdded)
         self:setRuntimeError("Commander, I could only deliver %1% of the %2% units to %3%. The station was full. I'm aborting with %4% units of cargo left in the hold."%_T, added, amountToDeliver, haul.target.name, notAdded)
         return
     end
@@ -621,13 +777,18 @@ function StockFactoryCommand:onGoodsDelivered(good, added, notAdded)
     self.data.rescanCooldown = returnLeg -- simulate the trip back before the next haul
 end
 
-function StockFactoryCommand:transactionError(msg, ...)
+function StockFactoryCommand:transactionError(commandToken, transactionId, msg, ...)
+    local transaction = self.data.transaction
+    if self.data.commandToken ~= commandToken or not transaction or transaction.id ~= transactionId then return end
+    self.data.transaction = nil
     self:setRuntimeError(msg, ...)
 end
 
 function StockFactoryCommand:setRuntimeError(msg, ...)
+    local owner = getParentFaction()
     eprint(msg, ...)
-    getParentFaction():sendChatMessage("", ChatMessageType.Error, msg, ...)
+    owner:sendChatMessage("", ChatMessageType.Error, msg, ...)
+    clearCommandLease(owner.index, self.shipName, self.data.commandToken)
     self.finishOnNextUpdate = true
 end
 
@@ -653,6 +814,11 @@ local function computeReachableRegion(owner, originX, originY)
     local cameFrom = {}
     local gateDepth = {}
     local count = 0
+
+    local function blockedByWar(x, y)
+        local faction = Galaxy():getControllingFaction(x, y)
+        return StockFactoryUtility.isFactionBlockedByWar(owner, faction)
+    end
 
     local function add(x, y)
         local key = skey(x, y)
@@ -685,7 +851,7 @@ local function computeReachableRegion(owner, originX, originY)
 
                 for _, coord in pairs(connected) do
                     local key = skey(coord.x, coord.y)
-                    if not gateVisited[key] then
+                    if not gateVisited[key] and not blockedByWar(coord.x, coord.y) then
                         gateVisited[key] = true
                         cameFrom[key] = {x = sector.x, y = sector.y}
                         gateDepth[key] = depth
@@ -716,6 +882,7 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
 
     local function addFaction(faction)
         if not faction or factionSeen[faction.index] then return end
+        if not StockFactoryUtility.canUseStation(owner, faction.index, callingPlayer) then return end
         factionSeen[faction.index] = true
         table.insert(factions, faction)
     end
@@ -739,7 +906,9 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
 
             local entry = ShipDatabaseEntry(faction.index, name)
 
-            if valid(entry) and entry:getEntityType() == EntityType.Station then
+            if valid(entry)
+                and entry:getAvailability() == ShipAvailability.Available
+                and entry:getEntityType() == EntityType.Station then
                 local x, y = entry:getCoordinates()
                 if reachable and not reachable[skey(x, y)] then
                     goto continue
@@ -751,6 +920,8 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
                 local buys = {}
                 local sells = {}
                 local hasTrade = false
+                local pickupEnabled  = true
+                local deliveryEnabled = true
 
                 for i, script in pairs(scripts) do
                     local isTrade = false
@@ -763,6 +934,12 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
 
                     if isTrade then
                         local values = secured[i] or {}
+
+                        -- read stock-hauler opt-out flags (default enabled when absent)
+                        local pf = values.stockHaulerPickupEnabled
+                        if pf ~= nil then pickupEnabled  = pickupEnabled  and pf end
+                        local df = values.stockHaulerDeliveryEnabled
+                        if df ~= nil then deliveryEnabled = deliveryEnabled and df end
 
                         local soldGoods = values.soldGoods
                         if not soldGoods and values.tradingData then soldGoods = values.tradingData.soldGoods end
@@ -807,7 +984,12 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
 
                 if hasTrade then
                     seenStations[stationKey] = true
-                    table.insert(stations, {name = name, factionIndex = faction.index, x = x, y = y, buys = buys, sells = sells})
+                    table.insert(stations, {
+                        name = name, factionIndex = faction.index, x = x, y = y,
+                        buys = buys, sells = sells,
+                        stockHaulerPickupEnabled   = pickupEnabled,
+                        stockHaulerDeliveryEnabled = deliveryEnabled,
+                    })
                 end
             end
 
@@ -860,29 +1042,23 @@ end
 -- periodic re-mapping + failure handling
 ---------------------------------------------------------------------
 
--- true if at least one selected good can still be sourced from a reachable owned
--- supplier (i.e. the command can still do its job at all)
-function StockFactoryCommand:hasAnyReachableSource()
-    for _, good in pairs(self.config.goods or {}) do
-        if isGoodEligible(good) then
-            for _, target in pairs(self:eligibleTargets(good)) do
-                if #self:eligibleSources(good, target) > 0 then
-                    return true
-                end
+-- true if at least one good can still be sourced from a reachable owned supplier
+function StockFactoryCommand:hasAnyReachableSource(regionGoods)
+    for good, _ in pairs(regionGoods or allStationGoods(self.data.stations)) do
+        for _, target in pairs(self:eligibleTargets(good)) do
+            if #self:eligibleSources(good, target) > 0 then
+                return true
             end
         end
     end
     return false
 end
 
--- returns true when at least one consumer exists for any selected good; used to
--- decide whether to recall (no consumer = permanently stuck) vs. wait (no source yet)
-function StockFactoryCommand:hasAnyConsumer()
-    for _, good in pairs(self.config.goods or {}) do
-        if isGoodEligible(good) then
-            if #self:eligibleTargets(good) > 0 then
-                return true
-            end
+-- returns true when at least one consumer exists for any eligible good
+function StockFactoryCommand:hasAnyConsumer(regionGoods)
+    for good, _ in pairs(regionGoods or allStationGoods(self.data.stations)) do
+        if #self:eligibleTargets(good) > 0 then
+            return true
         end
     end
     return false
@@ -913,8 +1089,12 @@ function StockFactoryCommand:remapRoute()
     self.data.gateDepth = gateDepth
     self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
 
-    if not self:hasAnyConsumer() then
-        self:setRuntimeError("Commander, the consumer stations for the selected goods are gone from the anchor region. Recalling."%_T)
+    local regionGoods = allStationGoods(self.data.stations)
+
+    if not self:hasAnyConsumer(regionGoods) then
+        self:setRuntimeError("Commander, no station in the anchor region buys anything I'm allowed to haul any more. Recalling."%_T)
+    elseif not self:hasAnyReachableSource(regionGoods) then
+        self:setRuntimeError("Commander, no producer I'm allowed to haul from is still reachable from the anchor region. Recalling."%_T)
     end
 end
 
@@ -1042,10 +1222,10 @@ end
 function StockFactoryCommand:getDescriptionText()
     local anchor = self.data and self.data.anchor
     if anchor then
-        return "The ship is stocking your stations in the anchor region around \\s(${x}:${y}), moving selected goods between your own producers and consumers."%_T, {x = anchor.x, y = anchor.y}
+        return "The ship is stocking your stations in the anchor region around \\s(${x}:${y}), moving all eligible goods between your own producers and consumers (except any you have added to the ignore list)."%_T, {x = anchor.x, y = anchor.y}
     end
 
-    return "The ship is stocking your stations in the anchor region, moving selected goods between your own producers and consumers."%_T
+    return "The ship is stocking your stations in the anchor region, moving all eligible goods between your own producers and consumers."%_T
 end
 
 function StockFactoryCommand:getStatusMessage()
@@ -1061,17 +1241,20 @@ function StockFactoryCommand:getAreaBounds()
 end
 
 function StockFactoryCommand:getRecallError()
+    if self.data and self.data.transaction and (self.data.timer or 0) < RecallBlockSeconds then
+        return "A station cargo transfer is currently being committed. Try recalling again in a moment."%_T
+    end
 end
 
 function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
-    if not config.goods or #config.goods == 0 then
-        return "You haven't selected any goods for me to stock. Tick at least one good from your anchor region before I can start."%_t
-    end
-
     local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
 
     if prediction.numGoodsWithConsumer == 0 then
-        return "No consumer stations for the selected goods were found in the anchor region (up to 5 gate jumps). Add a station that buys those goods."%_t
+        return "No consumer stations were found in the anchor region (up to 5 gate jumps). Add a station that buys goods."%_t
+    end
+
+    if prediction.numGoodsWithSource == 0 then
+        return "No producer-to-consumer route was found for any good I'm allowed to haul."%_t
     end
 
     return
@@ -1094,7 +1277,7 @@ function StockFactoryCommand:getAreaSelectionTooltip(ownerIndex, shipName, area,
 end
 
 function StockFactoryCommand:getConfigurableValues(ownerIndex, shipName)
-    return {}
+    return {ignoredGoods = {default = {}}}
 end
 
 function StockFactoryCommand:getPredictableValues()
@@ -1120,37 +1303,40 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     local goodsWithSource = {}
     local goodsWithConsumer = {}
 
-    if config.goods then
-        for _, good in pairs(config.goods) do
-            if isGoodEligible(good) then
-                -- count producers independently: any station that sells but doesn't also buy this good
-                for _, source in pairs(stations) do
-                    if source.sells and source.sells[good]
-                        and not (source.buys and source.buys[good]) then
-                        local srckey = (source.factionIndex or 0) .. ":" .. source.name
-                        producerStations[srckey] = true
-                    end
-                end
+    for good, _ in pairs(allStationGoods(stations)) do
+        if isGoodIgnored(config, good) then goto continue end
 
-                -- count consumers independently, and check for complete pairs
-                local hasPair = false
-                for _, target in pairs(stations) do
-                    if target.buys and target.buys[good] then
-                        goodsWithConsumer[good] = true
-                        local tkey = (target.factionIndex or 0) .. ":" .. target.name
-                        consumerStations[tkey] = true
-                        for _, source in pairs(stations) do
-                            if not (source.name == target.name and source.factionIndex == target.factionIndex)
-                                and source.sells and source.sells[good]
-                                and not (source.buys and source.buys[good]) then
-                                hasPair = true
-                            end
-                        end
-                    end
-                end
-                if hasPair then goodsWithSource[good] = true end
+        -- count producers independently: any station that sells but doesn't also buy this good
+        for _, source in pairs(stations) do
+            if source.sells and source.sells[good]
+                and not (source.buys and source.buys[good])
+                and source.stockHaulerPickupEnabled ~= false then
+                local srckey = (source.factionIndex or 0) .. ":" .. source.name
+                producerStations[srckey] = true
             end
         end
+
+        -- count consumers independently, and check for complete pairs
+        local hasPair = false
+        for _, target in pairs(stations) do
+            if target.buys and target.buys[good]
+                and target.stockHaulerDeliveryEnabled ~= false then
+                goodsWithConsumer[good] = true
+                local tkey = (target.factionIndex or 0) .. ":" .. target.name
+                consumerStations[tkey] = true
+                for _, source in pairs(stations) do
+                    if not (source.name == target.name and source.factionIndex == target.factionIndex)
+                        and source.sells and source.sells[good]
+                        and not (source.buys and source.buys[good])
+                        and source.stockHaulerPickupEnabled ~= false then
+                        hasPair = true
+                    end
+                end
+            end
+        end
+        if hasPair then goodsWithSource[good] = true end
+
+        ::continue::
     end
 
     prediction.producers.value = tablelength(producerStations)
@@ -1193,43 +1379,17 @@ end
 -- client UI
 ---------------------------------------------------------------------
 
--- collects the goods traded by the anchor-region stations (consumed or produced),
--- filtered to eligible goods and sorted.
-local function anchorRegionGoods(stations)
-    local list = {}
-    local seen = {}
-
-    for _, station in pairs(stations or {}) do
-        for good, _ in pairs(station.buys or {}) do
-            if not seen[good] and isGoodEligible(good) then
-                seen[good] = true
-                table.insert(list, good)
-            end
-        end
-
-        for good, _ in pairs(station.sells or {}) do
-            if not seen[good] and isGoodEligible(good) then
-                seen[good] = true
-                table.insert(list, good)
-            end
-        end
-    end
-
-    table.sort(list)
-    return list
-end
-
 function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback)
     local ui = {}
     ui.orderName = "Stock Factory"%_t
     ui.icon = StockFactoryCommand:getIcon()
 
-    local size = vec2(700, 720)
+    local size = vec2(700, 780)
 
     ui.window = GalaxyMap():createWindow(Rect(size))
     ui.window.caption = "Stock Factory"%_t
 
-    local settings = {areaHeight = 110, configHeight = 290, hideEscortUI = true}
+    local settings = {areaHeight = 110, configHeight = 180, hideEscortUI = true}
     ui.commonUI = SimulationUtility.buildCommandUI(ui.window, startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback, settings)
 
     -- brief "how it works" description, shown in the top-right panel (the space
@@ -1245,10 +1405,10 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
         "Anchors to one sector and operates in that sector plus sectors up to 5 gate jumps away."%_t .. "\n\n" ..
-        "The ship ferries only the goods you select, moving them between your own producer and consumer stations in that anchor region."%_t .. "\n\n" ..
-        "It never hauls more than a consumer station needs, and never takes a good from a station that also buys it."%_t
+        "The ship automatically hauls all eligible goods it can find source-target pairs for."%_t .. "\n\n" ..
+        "It never hauls more than a consumer station needs, and never takes a good from a station that also buys it.\n\nUse the toggle buttons on station buy/sell tabs to exclude individual stations."%_t
 
-    -- config: anchor sector + goods checklist
+    -- config: anchor sector and goods denylist
     local configRect = ui.commonUI.configRect
     local vlist = UIVerticalLister(configRect, 8, 0)
 
@@ -1258,53 +1418,72 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.anchorSectorLabel = ui.window:createLabel(headerSplit.right, ""%_t, 13)
     ui.anchorSectorLabel:setCenterAligned()
 
-    vlist:nextRect(4)
-    ui.window:createLabel(vlist:nextRect(15), "Goods to keep stocked:"%_t, 12)
+    ui.window:createLabel(vlist:nextRect(18), "Ignored Goods:"%_t, 13)
 
-    -- scrollable goods list with row coloring for selection
-    -- use vlist to manage layout properly, allocate most space for goods list
-    local gridRect = vlist:nextRect(200)  -- take most remaining space
-    ui.goodsList = ui.window:createListBoxEx(gridRect)
-    ui.goodsList.columns = 1
-    ui.goodsList:setColumnWidth(0, gridRect.width)
-    ui.goodsList.entriesSelectable = true
-    ui._selectedGoods = {}
-    ui._previousGoods = {}
-    ui._configChangedCallbackName = configChangedCallback
-    ui._listSelectionCallbackName = self.type .. "_GoodsListSelectionChanged"
-    ui._selectAllPressedCallback = self.type .. "_SelectAllGoodsPressed"
-    ui._clearPressedCallback = self.type .. "_ClearGoodsSelectionPressed"
-    ui._pendingGoodsToggle = false
-    ui.goodsList.onSelectFunction = ui._listSelectionCallbackName
+    local editorRect = vlist:nextRect(28)
+    local editorSplit = UIVerticalSplitter(editorRect, 6, 0, 0.82)
+    ui.goodCombo = ui.window:createValueComboBox(editorSplit.left, "")
+    ui.goodCombo.height = 26
 
-    -- Select All / Clear buttons below the scroll area, using vlist layout
-    local buttonRect = vlist:nextRect(20)
-    local buttonSplit = UIVerticalSplitter(buttonRect, 5, 0, 0.5)
-    ui.selectAllButton = ui.window:createButton(buttonSplit.left, "Select All"%_t, ui._selectAllPressedCallback)
-    ui.clearSelectionButton = ui.window:createButton(buttonSplit.right, "Clear Selection"%_t, ui._clearPressedCallback)
+    local buttonSplit = UIVerticalSplitter(editorSplit.right, 4, 0, 0.5)
+    ui.addIgnoredGoodButton = ui.window:createButton(buttonSplit.left, "", "stockFactoryAddIgnoredGood")
+    ui.addIgnoredGoodButton.icon = "data/textures/icons/plus.png"
+    ui.addIgnoredGoodButton.tooltip = "Ignore the selected good."%_t
+    ui.removeIgnoredGoodButton = ui.window:createButton(buttonSplit.right, "", "stockFactoryRemoveIgnoredGood")
+    ui.removeIgnoredGoodButton.icon = "data/textures/icons/minus.png"
+    ui.removeIgnoredGoodButton.tooltip = "Haul the selected ignored good again."%_t
 
-    self.mapCommands[ui._listSelectionCallbackName] = function()
-        ui._pendingGoodsToggle = true
+    ui.ignoredGoodsList = ui.window:createListBox(vlist:nextRect(82))
+    ui.ignoredGoodsList.rowHeight = 20
+    ui.ignoredGoods = {}
+
+    ui.refreshGoods = function(self, area, config)
+        self.ignoredGoods = {}
+        local configuredGoods = config and config.ignoredGoods
+        if type(configuredGoods) ~= "table" then configuredGoods = {} end
+        for name, ignored in pairs(configuredGoods) do
+            if ignored then self.ignoredGoods[name] = true end
+        end
+
+        local available = {}
+        local stations = area and area.analysis and area.analysis.stations or {}
+        for name, _ in pairs(allStationGoods(stations)) do
+            if not self.ignoredGoods[name] then table.insert(available, name) end
+        end
+        table.sort(available, function(a, b) return goodDisplayName(a, 1) < goodDisplayName(b, 1) end)
+
+        self.goodCombo:clear()
+        self.goodCombo:addEntry("", "")
+        for _, name in pairs(available) do
+            self.goodCombo:addEntry(name, goodDisplayName(name, 1))
+        end
+        self.goodCombo:setSelectedValueNoCallback("")
+
+        local ignored = {}
+        for name, _ in pairs(self.ignoredGoods) do table.insert(ignored, name) end
+        table.sort(ignored, function(a, b) return goodDisplayName(a, 1) < goodDisplayName(b, 1) end)
+
+        self.ignoredGoodsList:clear()
+        for _, name in pairs(ignored) do
+            self.ignoredGoodsList:addEntry(goodDisplayName(name, 1), name)
+        end
+    end
+
+    self.mapCommands.stockFactoryAddIgnoredGood = function()
+        local name = ui.goodCombo.selectedValue
+        if not name or name == "" then return end
+
+        ui.ignoredGoods[name] = true
+        ui:refreshGoods(ui.currentArea, {ignoredGoods = ui.ignoredGoods})
         self.mapCommands[configChangedCallback]()
     end
 
-    self.mapCommands[ui._selectAllPressedCallback] = function()
-        for i = 0, ui.goodsList.rows - 1 do
-            local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
-            ui._selectedGoods[goodName] = true
-            ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(1, 1, 1))
-        end
-        ui._pendingGoodsToggle = false
-        self.mapCommands[configChangedCallback]()
-    end
+    self.mapCommands.stockFactoryRemoveIgnoredGood = function()
+        local name = ui.ignoredGoodsList.selectedValue
+        if not name or name == "" then return end
 
-    self.mapCommands[ui._clearPressedCallback] = function()
-        for i = 0, ui.goodsList.rows - 1 do
-            local _, _, _, _, goodName = ui.goodsList:getEntry(0, i)
-            ui._selectedGoods[goodName] = nil
-            ui.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, ColorRGB(0.65, 0.65, 0.65))
-        end
-        ui._pendingGoodsToggle = false
+        ui.ignoredGoods[name] = nil
+        ui:refreshGoods(ui.currentArea, {ignoredGoods = ui.ignoredGoods})
         self.mapCommands[configChangedCallback]()
     end
 
@@ -1346,16 +1525,14 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.clear = function(self, shipName)
         self.commonUI:clear(shipName)
         self.anchorSectorLabel.caption = ""
-        self.goodsList.onSelectFunction = ""
-        self.goodsList:clear()
-        self._selectedGoods = {}
-        self._previousGoods = {}
+        self.goodCombo:clear()
+        self.ignoredGoodsList:clear()
+        self.ignoredGoods = {}
+        self.currentArea = nil
     end
 
-    -- fills the goods checklist from all owned stations in the selected
-    -- anchor region (anchor + up to 3 gate jumps)
-    ui.refreshInputs = function(self, ownerIndex, shipName, area)
-        local stations = (area.analysis or {}).stations or {}
+    ui.refreshInputs = function(self, ownerIndex, shipName, area, config)
+        self.currentArea = area
         local ax, ay = areaAnchor(area)
         if ax then
             self.anchorSectorLabel.caption = "\\s(" .. ax .. ":" .. ay .. ")"
@@ -1363,75 +1540,30 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             self.anchorSectorLabel.caption = ""
         end
 
-        local inputGoods = anchorRegionGoods(stations)
-
-        -- only rebuild list if goods changed (area selection changed); otherwise just update checkbox states
-        local goodsChanged = #inputGoods ~= #self._previousGoods
-        if not goodsChanged then
-            for i, g in pairs(inputGoods) do
-                if self._previousGoods[i] ~= g then
-                    goodsChanged = true
-                    break
-                end
-            end
-        end
-
-        if goodsChanged then
-            -- goods list changed: rebuild and select all by default
-            self._previousGoods = {}
-            for _, g in pairs(inputGoods) do table.insert(self._previousGoods, g) end
-            self._selectedGoods = {}
-
-            -- first time: auto-select all goods
-            for _, g in pairs(inputGoods) do
-                self._selectedGoods[g] = true
-            end
-
-            self.goodsList.onSelectFunction = ""  -- suspend callback during rebuild
-            self.goodsList:clear()
-            for _, goodName in pairs(inputGoods) do
-                self.goodsList:addRow(goodName)
-                local rowIdx = self.goodsList.rows - 1
-                local isSelected = self._selectedGoods[goodName]
-                local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
-                self.goodsList:setEntry(0, rowIdx, goodDisplayName(goodName, 2), false, false, color)
-                self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.Text)
-                self.goodsList:setColumnWidth(0, self.goodsList.width)
-            end
-            self.goodsList.onSelectFunction = self._listSelectionCallbackName
-        else
-            -- goods unchanged: just update checkbox states
-            for i = 0, self.goodsList.rows - 1 do
-                local _, _, _, _, goodName = self.goodsList:getEntry(0, i)
-                local isSelected = self._selectedGoods[goodName]
-                local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
-                self.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, color)
-            end
-        end
+        self:refreshGoods(area, config or {ignoredGoods = self.ignoredGoods})
     end
 
     ui.refresh = function(self, ownerIndex, shipName, area, config)
         self.commonUI:refresh(ownerIndex, shipName, area, config)
 
         if not config then
-            self:refreshInputs(ownerIndex, shipName, area)
+            self:refreshInputs(ownerIndex, shipName, area, {ignoredGoods = {}})
             config = self:buildConfig()
+        else
+            self:refreshInputs(ownerIndex, shipName, area, config)
         end
 
         self:refreshPredictions(ownerIndex, shipName, area, config)
     end
 
     ui.refreshPredictions = function(self, ownerIndex, shipName, area, config)
-        self:refreshInputs(ownerIndex, shipName, area)
+        self:refreshInputs(ownerIndex, shipName, area, config)
 
         local prediction = StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, config)
         self:displayPrediction(prediction, config, ownerIndex)
 
         self.commonUI:refreshPredictions(ownerIndex, shipName, area, config, StockFactoryCommand, prediction)
-
-        if not config.goods or #config.goods == 0 then
-            self.commonUI.startButton.active = false
-        end
+        -- no minimum config required; command can start with an empty ignore list
     end
 
     ui.displayPrediction = function(self, prediction, config, ownerIndex)
@@ -1442,55 +1574,24 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     end
 
     ui.buildConfig = function(self)
-        -- only toggle on real list-click callbacks; buildConfig is also called by
-        -- start/prediction flows where selectedValue may still hold stale state.
-        local clicked = self._pendingGoodsToggle and self.goodsList.selectedValue or nil
-        self._pendingGoodsToggle = false
-        if clicked and clicked ~= "" then
-            self._selectedGoods[clicked] = not self._selectedGoods[clicked]
-            -- update that row's color immediately without rebuilding the entire list
-            for i = 0, self.goodsList.rows - 1 do
-                local _, _, _, _, goodName = self.goodsList:getEntry(0, i)
-                if goodName == clicked then
-                    local isSelected = self._selectedGoods[clicked]
-                    local color = isSelected and ColorRGB(1, 1, 1) or ColorRGB(0.65, 0.65, 0.65)
-                    self.goodsList:setEntry(0, i, goodDisplayName(goodName, 2), false, false, color)
-                    break
-                end
-            end
-        end
-
         local config = {}
         config.escorts = self.commonUI.escortUI:buildConfig()
-        config.goods = {}
-        for good, _ in pairs(self._selectedGoods) do
-            table.insert(config.goods, good)
+        config.ignoredGoods = {}
+        for name, ignored in pairs(self.ignoredGoods or {}) do
+            if ignored then config.ignoredGoods[name] = true end
         end
         return config
     end
 
     ui.displayConfig = function(self, config, ownerIndex)
-        -- read-only display of a running command
-        self.goodsList.onSelectFunction = ""
-        self.goodsList.entriesSelectable = false
-        self.selectAllButton.active = false
-        self.clearSelectionButton.active = false
-        self.goodsList:clear()
-        for _, goodName in pairs(config.goods or {}) do
-            self.goodsList:addRow(goodName)
-            local rowIdx = self.goodsList.rows - 1
-            self.goodsList:setEntry(0, rowIdx, goodDisplayName(goodName, 2), false, false, ColorRGB(0.5, 0.8, 0.5))
-            self.goodsList:setEntryType(0, rowIdx, ListBoxEntryType.Text)
-            self.goodsList:setColumnWidth(0, self.goodsList.width)
-        end
+        self:refreshGoods(self.currentArea, config)
     end
 
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
-        self.goodsList.entriesSelectable = active
-        self.goodsList.onSelectFunction = active and self._listSelectionCallbackName or ""
-        self.selectAllButton.active = active
-        self.clearSelectionButton.active = active
+        self.goodCombo.active = active
+        self.addIgnoredGoodButton.active = active
+        self.removeIgnoredGoodButton.active = active
     end
 
     ui.onWindowClosed = function(self)
