@@ -46,8 +46,10 @@ function tablelength(values)
 end
 function valid(value) return value ~= nil end
 function eprint() end
+
+local randomPicksHigh = false
 function random()
-    return {getInt = function(_, low) return low end}
+    return {getInt = function(_, low, high) return randomPicksHigh and high or low end}
 end
 
 ChatMessageType = {Error = 1, Normal = 2}
@@ -122,6 +124,18 @@ check("planning picks the producer/consumer pair",
 check("planning resolves the trade script for both ends",
     planner.data.currentHaul.source.script == "seller.lua"
         and planner.data.currentHaul.target.script == "factory.lua")
+
+check("a haul leg is at least 2 minutes", planner.data.currentHaul.travelTime == 2 * 60)
+check("every leg of a haul uses the same travel time",
+    planner.data.currentHaul.pickupTravelTime == planner.data.currentHaul.travelTime
+        and planner.data.currentHaul.deliveryTravelTime == planner.data.currentHaul.travelTime)
+
+randomPicksHigh = true
+local slowPlanner = Factory("Hauler", area, {ignoredGoods = {}})
+slowPlanner.data.stations = pairedStations()
+slowPlanner:planNextHaul()
+check("a haul leg is at most 3 minutes", slowPlanner.data.currentHaul.travelTime == 3 * 60)
+randomPicksHigh = false
 
 local ignoring = Factory("Hauler", area, {ignoredGoods = {Iron = true}})
 ignoring.data.stations = pairedStations()
@@ -214,6 +228,10 @@ command.data.currentHaul = haul
 haul.carriedAmount = 10
 command:onGoodsDelivered("current-command", 61, "Iron", 10, 0)
 check("a successful delivery resets the timeout budget", command.data.transactionTimeouts == 0)
+check("a delivered haul goes straight to the next job with no trip home",
+    command.data.phase == "idle"
+        and command.data.currentHaul == nil
+        and command.data.rescanCooldown == 0)
 
 print("\n[restore]")
 

@@ -50,6 +50,7 @@ local nextHop
 local nextHopReady = false
 local nextHopUseGate = false
 local dockTarget
+local loiterHere = false
 
 -- arrival bookkeeping: we hold at the spawn point until the command answers with our
 -- route, so a slow reply is never mistaken for "nothing to dock at here"
@@ -157,9 +158,10 @@ function initialize(faction)
 end
 
 -- called by the command (through the sector) with the next hop of our route
-function setNextHop(nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
+function setNextHop(nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
     nextHop = {x = nextX, y = nextY}
     nextHopUseGate = useGate and true or false
+    loiterHere = loiter and true or false
 
     if hasDockTarget and dockName and dockName ~= "" then
         dockTarget = {
@@ -184,6 +186,7 @@ function secure()
         nextHopReady = nextHopReady,
         nextHopUseGate = nextHopUseGate,
         dockTarget = dockTarget,
+        loiterHere = loiterHere,
     }
 end
 
@@ -196,6 +199,7 @@ function restore(values)
     nextHopReady = values.nextHopReady and true or false
     nextHopUseGate = values.nextHopUseGate and true or false
     dockTarget = values.dockTarget
+    loiterHere = values.loiterHere and true or false
 end
 
 -- exact station for the current pickup/delivery leg, supplied by the command
@@ -304,6 +308,15 @@ function updateServer(timeStep)
 
     if not arrived then
         doArrival(ship)
+    end
+
+    -- waiting for work at the anchor: let the vanilla appearance behaviour fly the ship
+    -- around until the appearance expires, instead of jumping straight back out
+    if loiterHere then
+        DockAI.reset()
+        ship:addScriptOnce("ai/patrolpeacefully.lua")
+        terminate()
+        return
     end
 
     stage = stage or 0

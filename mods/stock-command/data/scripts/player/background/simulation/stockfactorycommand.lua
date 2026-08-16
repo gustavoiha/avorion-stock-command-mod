@@ -19,10 +19,11 @@ StockFactoryCommand.type = CommandType.StockFactory
 -- anchor-sector operating radius over the gate network
 local MaxGateJumps = 5
 
--- suppliers are reached purely through the gate network; cycle time is modelled
--- per gate jump between the target and the supplier, plus a fixed docking overhead
-local SecondsPerGateJump = 45
-local DockingSeconds = 120
+-- How long one leg of a haul takes. Flat rather than distance-based, so a haul is a
+-- predictable few minutes of work wherever the stations are. Whole minutes only: the
+-- background simulation ticks once a minute, so anything else just rounds up to one.
+local MinTravelMinutes = 2
+local MaxTravelMinutes = 3
 
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
@@ -203,7 +204,6 @@ function StockFactoryCommand:onStart()
     self.data.stations = analysis.stations or {}
     self.data.reachable = analysis.reachable or {}
     self.data.gateCameFrom = analysis.gateCameFrom or {}
-    self.data.gateDepth = analysis.gateDepth or {}
     self.data.callingPlayer = analysis.callingPlayer
     self.config = self.config or {}
     self.config.ignoredGoods = self.config.ignoredGoods or {}
@@ -260,8 +260,12 @@ function StockFactoryCommand:update(timeStep)
             return
         end
 
-        if self.data.timer >= (haul.pickupTravelTime or haul.travelTime or 60) then
+        local legTime = haul.pickupTravelTime or haul.travelTime or 60
+        if self.data.timer >= legTime then
             self:beginPickupTransaction()
+        elseif self.data.timer + timeStep >= legTime then
+            -- sector loading is async, so start it a tick early and arrive to a ready sector
+            self:querySectors(true, true)
         end
 
     elseif phase == "haulingToTarget" then
@@ -271,8 +275,11 @@ function StockFactoryCommand:update(timeStep)
             return
         end
 
-        if self.data.timer >= (haul.deliveryTravelTime or haul.travelTime or 60) then
+        local legTime = haul.deliveryTravelTime or haul.travelTime or 60
+        if self.data.timer >= legTime then
             self:beginDeliveryTransaction()
+        elseif self.data.timer + timeStep >= legTime then
+            self:querySectors(false, true)
         end
 
     elseif phase == "transactingPickup" or phase == "transactingDelivery" then
@@ -408,15 +415,9 @@ function StockFactoryCommand:eligibleSources(good, target)
     return result
 end
 
--- travel time for one leg of the haul, modelled from the number of gate jumps
--- between the target and the supplier (recorded during the reachable-region BFS)
--- plus a fixed docking overhead. Distance through empty space is irrelevant here.
-function StockFactoryCommand:estimateTravelTime(source, target)
-    local depthMap = self.data.gateDepth or {}
-    local sourceJumps = depthMap[skey(source.x, source.y)] or MaxGateJumps
-    local targetJumps = depthMap[skey(target.x, target.y)] or MaxGateJumps
-    local jumps = math.max(1, sourceJumps + targetJumps)
-    return jumps * SecondsPerGateJump + DockingSeconds
+-- travel time for one leg of the haul
+function StockFactoryCommand:estimateTravelTime()
+    return random():getInt(MinTravelMinutes, MaxTravelMinutes) * 60
 end
 
 function StockFactoryCommand:planNextHaul()
@@ -445,7 +446,7 @@ function StockFactoryCommand:planNextHaul()
             pick = pick - pairsForGood
         end
 
-        local travelTime = self:estimateTravelTime(source, target)
+        local travelTime = self:estimateTravelTime()
 
         self.data.currentHaul = {
             good = good,
@@ -884,12 +885,11 @@ function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good,
     owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% delivered %4% units of %5% to %6%."%_T,
         haul.target.x, haul.target.y, self.shipName, added, goodName, targetStationName)
 
-    local returnLeg = (haul and haul.travelTime) or 60
-
     haul.carriedAmount = 0
     self.data.currentHaul = nil
     self.data.phase = "idle"
-    self.data.rescanCooldown = returnLeg -- simulate the trip back before the next haul
+    -- no trip home: the next haul's outbound leg already covers target -> next source
+    self.data.rescanCooldown = 0
 end
 
 function StockFactoryCommand:transactionError(commandToken, transactionId, msg, ...)
@@ -1002,12 +1002,11 @@ local function gateNeighbours(x, y)
 end
 
 -- BFS over the gate network from the anchor sector, bounded to MaxGateJumps.
--- Returns the reachable set, a gate-predecessor map (cameFrom[key] points one hop
--- closer to the anchor), and gate depths.
+-- Returns the reachable set and a gate-predecessor map (cameFrom[key] points one hop
+-- closer to the anchor).
 local function computeReachableRegion(owner, originX, originY)
     local reachable = {}
     local cameFrom = {}
-    local gateDepth = {}
     local count = 0
 
     refreshBuiltGateLinks()
@@ -1032,7 +1031,6 @@ local function computeReachableRegion(owner, originX, originY)
     do
         local originKey = skey(originX, originY)
         local gateVisited = {[originKey] = true}
-        gateDepth[originKey] = 0
         local frontier = {{x = originX, y = originY}}
         local depth = 0
 
@@ -1046,11 +1044,10 @@ local function computeReachableRegion(owner, originX, originY)
                     if not gateVisited[key] and not blockedByWar(coord.x, coord.y) then
                         gateVisited[key] = true
                         cameFrom[key] = {x = sector.x, y = sector.y}
-                        gateDepth[key] = depth
                         add(coord.x, coord.y)
                         table.insert(nextFrontier, coord)
                         if count >= MaxReachableSectors then
-                            return reachable, cameFrom, gateDepth
+                            return reachable, cameFrom
                         end
                     end
                 end
@@ -1060,7 +1057,7 @@ local function computeReachableRegion(owner, originX, originY)
         end
     end
 
-    return reachable, cameFrom, gateDepth
+    return reachable, cameFrom
 end
 
 -- Reading a station's secured script values deserialises its whole trading state, so the
@@ -1233,10 +1230,9 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
         ax, ay = meta.faction:getShipPosition(meta.shipName)
     end
 
-    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, ax, ay)
+    local reachable, gateCameFrom = computeReachableRegion(owner, ax, ay)
     results.reachable = reachable
     results.gateCameFrom = gateCameFrom
-    results.gateDepth = gateDepth
     results.anchor = {x = ax, y = ay}
     results.callingPlayer = meta.callingPlayer
 
@@ -1318,10 +1314,9 @@ function StockFactoryCommand:remapRoute()
         end
     end
 
-    local reachable, gateCameFrom, gateDepth = computeReachableRegion(owner, anchor.x, anchor.y)
+    local reachable, gateCameFrom = computeReachableRegion(owner, anchor.x, anchor.y)
     self.data.reachable = reachable
     self.data.gateCameFrom = gateCameFrom
-    self.data.gateDepth = gateDepth
     self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
 end
 
@@ -1335,10 +1330,10 @@ local ferryReplyCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 
-function run(faction, shipName, nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
+function run(faction, shipName, nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
     for _, entity in pairs({Sector():getEntitiesByScriptValue("displayed_faction")}) do
         if entity:getValue("displayed_faction") == faction and entity.name == shipName then
-            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget)
+            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
         end
     end
 end
@@ -1432,13 +1427,18 @@ function StockFactoryCommand:onFerryRouteRequest(sx, sy)
     local nextX, nextY, useGate = self:computeFerryNextHop(sx, sy)
     local dockTarget = self:getFerryDockTarget()
 
+    -- with no haul the ship is waiting out its shift at the anchor, not passing through
+    local anchor = self.data.anchor or {}
+    local loiter = not self.data.currentHaul and sx == anchor.x and sy == anchor.y
+
     runSectorCode(sx, sy, true, ferryReplyCode, "run", owner.index, self.shipName,
         nextX or 0, nextY or 0, useGate and true or false,
         dockTarget and (dockTarget.factionIndex or 0) or 0,
         dockTarget and dockTarget.name or "",
         dockTarget and dockTarget.x or 0,
         dockTarget and dockTarget.y or 0,
-        dockTarget and true or false)
+        dockTarget and true or false,
+        loiter)
 end
 
 

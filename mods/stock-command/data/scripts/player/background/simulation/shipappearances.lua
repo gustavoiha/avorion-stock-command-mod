@@ -27,15 +27,20 @@ if onServer() then
 
 -- The ferry AI only ever docks the station of the leg it is currently flying
 -- (ai/stockfactoryferry.lua treats every other sector as a transit hop and leaves again
--- immediately), so the appearance has to be placed in exactly that sector. An idle command
--- has no leg and therefore no place to be seen.
+-- immediately), so the appearance has to be placed in exactly that sector. With no leg in
+-- progress the ship is waiting for work, which it does at its anchor sector.
 local function stockFactoryDockSector(shipName)
     if not Simulation then return end
 
     for _, command in pairs(Simulation.commands) do
         if command.shipName == shipName and command.data then
             local haul = command.data.currentHaul
-            if not haul then return end
+
+            if not haul then
+                local anchor = command.data.anchor
+                if anchor and anchor.x and anchor.y then return anchor.x, anchor.y end
+                return
+            end
 
             local phase = command.data.phase
             local stop

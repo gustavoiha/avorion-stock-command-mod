@@ -25,4 +25,38 @@ function BackgroundShipAppearance.updateCommandBehavior(owner, ship)
     return stockFactoryOriginalUpdateCommandBehavior(owner, ship)
 end
 
+-- Vanilla mixes command-specific lines with GeneralLines, which includes "So, I guess you
+-- enjoy monitoring my work, Commander?" -- odd coming from a freighter that is only passing
+-- through. Stock Factory ferries get their own haulage-themed set instead.
+local StockFactoryLines = {
+    "Manifest's clear, Commander. Hold's where it needs to be."%_T,
+    "Another run, another station topped up."%_T,
+    "Cargo's secured. Moving on to the next pickup."%_T,
+    "Somebody has to keep these production lines fed."%_T,
+    "The route's steady. Your stations won't run dry on my watch."%_T,
+    "Loading, hauling, unloading. Honest work, Commander."%_T,
+    "I'll have this delivered before the foreman starts complaining."%_T,
+}
+
+local stockFactoryChatterTimer = random():getFloat(0, 40)
+local stockFactoryOriginalUpdateChatter = BackgroundShipAppearance.updateChatter
+
+function BackgroundShipAppearance.updateChatter(owner, timeStep)
+    if data.command ~= CommandType.StockFactory then
+        return stockFactoryOriginalUpdateChatter(owner, timeStep)
+    end
+
+    stockFactoryChatterTimer = stockFactoryChatterTimer + timeStep
+    if stockFactoryChatterTimer < 90 then return end
+    stockFactoryChatterTimer = 0
+
+    if not random():test(0.5) then return end
+
+    local captain = CrewComponent():getCaptain()
+    if not captain then return end
+
+    owner:sendChatMessage(Entity(), ChatMessageType.Chatter, "Captain %1%: %2%"%_T,
+        captain.name, randomEntry(StockFactoryLines))
+end
+
 end -- onServer()
