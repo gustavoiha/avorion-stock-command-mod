@@ -46,6 +46,9 @@ function tablelength(values)
 end
 function valid(value) return value ~= nil end
 function eprint() end
+function random()
+    return {getInt = function(_, low) return low end}
+end
 
 ChatMessageType = {Error = 1, Normal = 2}
 
@@ -98,6 +101,49 @@ command.config.ignoredGoods.Iron = nil
 command.data.stations[1].stockHaulerPickupEnabled = false
 check("pickup opt-out removes the route", not command:hasAnyReachableSource())
 check("pickup opt-out affects prediction", command:calculatePrediction(10, "Hauler", area, command.config).numGoodsWithSource == 0)
+
+print("\n[haul planning]")
+
+local function pairedStations()
+    return {
+        {name = "Iron Mine", factionIndex = 10, x = 0, y = 0, sells = {Iron = "seller.lua"}, buys = {}},
+        {name = "Steel Mill", factionIndex = 10, x = 0, y = 0, sells = {Steel = "factory.lua"}, buys = {Iron = "factory.lua"}},
+    }
+end
+
+local planner = Factory("Hauler", area, {ignoredGoods = {}})
+planner.data.stations = pairedStations()
+planner:planNextHaul()
+check("planning picks the producer/consumer pair",
+    planner.data.phase == "haulingToSource"
+        and planner.data.currentHaul.good == "Iron"
+        and planner.data.currentHaul.source.name == "Iron Mine"
+        and planner.data.currentHaul.target.name == "Steel Mill")
+check("planning resolves the trade script for both ends",
+    planner.data.currentHaul.source.script == "seller.lua"
+        and planner.data.currentHaul.target.script == "factory.lua")
+
+local ignoring = Factory("Hauler", area, {ignoredGoods = {Iron = true}})
+ignoring.data.stations = pairedStations()
+ignoring:planNextHaul()
+check("planning skips ignored goods", ignoring.data.currentHaul == nil and ignoring.data.phase == "idle")
+
+local producerOnly = Factory("Hauler", area, {ignoredGoods = {}})
+producerOnly.data.stations = {pairedStations()[1]}
+producerOnly:planNextHaul()
+check("planning without a consumer idles instead of failing",
+    producerOnly.data.phase == "idle" and producerOnly.data.currentHaul == nil)
+check("an idle hauler reports that it is waiting",
+    producerOnly:getStatusMessage() == "Waiting for goods to haul /* ship AI status */")
+check("a hauling ship reports that it is stocking",
+    planner:getStatusMessage() == "Stocking a sector /* ship AI status */")
+
+print("\n[assignment]")
+local empty = Factory("Hauler", {lower = {x = 0, y = 0}, upper = {x = 0, y = 0}, analysis = {}}, {ignoredGoods = {}})
+check("a hauler can be assigned with no stations in range",
+    empty:getErrors(10, "Hauler", empty.area, empty.config) == nil)
+check("a hauler can be assigned when nothing pairs up",
+    producerOnly:getErrors(10, "Hauler", area, producerOnly.config) == nil)
 
 print("\n[callback correlation]")
 command.data.phase = "transactingPickup"

@@ -36,6 +36,14 @@ local CommandLeaseKey = "stock_factory_command_lease"
 local TransactionTimeout = 300
 local MaxTransactionTimeouts = 2
 
+-- loaded sectors are fully simulated, so they are only held for as long as a queued
+-- runSectorCode job needs to reach its next update tick
+local SectorKeepSeconds = 30
+
+-- window in which every command that remaps in the same simulation tick shares one
+-- empire-wide station scan
+local StationTradeCacheSeconds = 10
+
 -- a committing transfer only blocks recall for this long, so a lost sector reply can
 -- never strand the ship (Simulation.forceRecall silently aborts on a recall error)
 local RecallBlockSeconds = 30
@@ -73,6 +81,43 @@ local function allStationGoods(stations)
         end
     end
     return result
+end
+
+-- One pass over the stations yields, per good, the stations that can receive it and the
+-- stations that can supply it. A target has to buy the good and a source must not, so the
+-- two lists are always disjoint.
+local function buildRouteIndex(stations, config)
+    local index = {}
+
+    local function entryFor(good)
+        local entry = index[good]
+        if not entry then
+            entry = {targets = {}, sources = {}}
+            index[good] = entry
+        end
+        return entry
+    end
+
+    for _, st in pairs(stations or {}) do
+        if st.stockHaulerDeliveryEnabled ~= false then
+            for good, _ in pairs(st.buys or {}) do
+                if isGoodEligible(good) and not isGoodIgnored(config, good) then
+                    table.insert(entryFor(good).targets, st)
+                end
+            end
+        end
+
+        if st.stockHaulerPickupEnabled ~= false then
+            for good, _ in pairs(st.sells or {}) do
+                if isGoodEligible(good) and not isGoodIgnored(config, good)
+                    and not (st.buys and st.buys[good]) then
+                    table.insert(entryFor(good).sources, st)
+                end
+            end
+        end
+    end
+
+    return index
 end
 
 local function goodDisplayName(name, amount)
@@ -373,26 +418,32 @@ function StockFactoryCommand:estimateTravelTime(source, target)
 end
 
 function StockFactoryCommand:planNextHaul()
-    -- Build all valid source/target pairs for all eligible goods and choose one at
-    -- random so the route order is not predictable (not alphabetical/rotational).
-    local candidates = {}
+    -- Choose one (good, source, target) triple uniformly at random so the route order is
+    -- not predictable, without building every triple: sources and targets are disjoint per
+    -- good, so a good contributes exactly #targets * #sources pairs.
+    local index = buildRouteIndex(self.data.stations, self.config)
 
-    local goodsInStations = allStationGoods(self.data.stations)
-    for good, _ in pairs(goodsInStations) do
-        local targets = self:eligibleTargets(good)
-        for _, target in pairs(targets) do
-            local sources = self:eligibleSources(good, target)
-            for _, source in pairs(sources) do
-                table.insert(candidates, {good = good, source = source, target = target})
-            end
-        end
+    local total = 0
+    for _, entry in pairs(index) do
+        total = total + #entry.targets * #entry.sources
     end
 
-    if #candidates > 0 then
-        local pick = candidates[random():getInt(1, #candidates)]
-        local good = pick.good
-        local source = pick.source
-        local target = pick.target
+    if total > 0 then
+        local pick = random():getInt(1, total)
+        local good, source, target
+
+        for name, entry in pairs(index) do
+            local pairsForGood = #entry.targets * #entry.sources
+            if pick <= pairsForGood then
+                good = name
+                target = entry.targets[math.floor((pick - 1) / #entry.sources) + 1]
+                source = entry.sources[(pick - 1) % #entry.sources + 1]
+                break
+            end
+            pick = pick - pairsForGood
+        end
+
+        local travelTime = self:estimateTravelTime(source, target)
 
         self.data.currentHaul = {
             good = good,
@@ -410,9 +461,9 @@ function StockFactoryCommand:planNextHaul()
                 y = target.y,
                 script = target.buys[good],
             },
-            travelTime = self:estimateTravelTime(source, target),
-            pickupTravelTime = self:estimateTravelTime(source, target),
-            deliveryTravelTime = self:estimateTravelTime(source, target),
+            travelTime = travelTime,
+            pickupTravelTime = travelTime,
+            deliveryTravelTime = travelTime,
             carriedAmount = 0,
         }
 
@@ -430,6 +481,29 @@ end
 ---------------------------------------------------------------------
 -- transactions (asynchronous, executed inside the loaded sectors)
 ---------------------------------------------------------------------
+
+-- Each sector job runs in a throwaway Lua state, so nothing it includes is ever reused.
+-- goods.lua would build a TradingGood for all ~150 goods and sort several derived arrays
+-- on every transfer; a job only ever touches one good, so it converts that one itself.
+local goodsHelperCode = [[
+include("goodsindex")
+goods["Silicium"] = goods["Silicium"] or goods["Silicon"]
+goods["Aluminium"] = goods["Aluminium"] or goods["Aluminum"]
+
+local function tradingGood(descriptor)
+    local price = descriptor.price
+    if price == 0 then price = 500 end
+
+    local good = TradingGood(descriptor.name, descriptor.plural, descriptor.description, descriptor.icon, price, descriptor.size)
+    good.mesh = descriptor.mesh or ""
+    good.illegal = descriptor.illegal or false
+    good.suspicious = descriptor.suspicious or false
+    good.stolen = descriptor.stolen or false
+    good.dangerous = descriptor.dangerous or false
+    good.tags = descriptor.tags or {}
+    return good
+end
+]]
 
 local probeCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
@@ -466,10 +540,10 @@ end
 
 local removeCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
-include("goods")
 include("utility")
 include("stringutility")
 local StockFactoryUtility = include("stockfactoryutility")
+]] .. goodsHelperCode .. [[
 
 function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
@@ -495,7 +569,7 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount, c
     end
 
     amount = math.min(amount, math.floor(ship:getFreeCargoSpace() / math.max(good.size or 1, 0.0001)))
-    local removed = StockFactoryUtility.transferToShip(CargoBay(station), ship, good:good(), amount)
+    local removed = StockFactoryUtility.transferToShip(CargoBay(station), ship, tradingGood(good), amount)
 
     invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsRemoved", commandToken, transactionId, goodName, removed)
 end
@@ -503,10 +577,10 @@ end
 
 local addCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
-include("goods")
 include("utility")
 include("stringutility")
 local StockFactoryUtility = include("stockfactoryutility")
+]] .. goodsHelperCode .. [[
 
 function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
@@ -531,7 +605,7 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount, c
         return
     end
 
-    local added, notAdded = StockFactoryUtility.transferToStation(CargoBay(station), ship, good:good(), amount)
+    local added, notAdded = StockFactoryUtility.transferToStation(CargoBay(station), ship, tradingGood(good), amount)
 
     invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsDelivered", commandToken, transactionId, goodName, added, notAdded)
 end
@@ -544,10 +618,10 @@ function StockFactoryCommand:querySectors(needSource, needTarget)
     if not t or not s then return false end
 
     if needTarget then
-        Galaxy():keepOrGetSector(t.x, t.y, 90)
+        Galaxy():keepOrGetSector(t.x, t.y, SectorKeepSeconds)
     end
     if needSource then
-        Galaxy():keepOrGetSector(s.x, s.y, 90)
+        Galaxy():keepOrGetSector(s.x, s.y, SectorKeepSeconds)
     end
 
     if needTarget and not Galaxy():sectorLoaded(t.x, t.y) then
@@ -806,6 +880,86 @@ end
 function StockFactoryCommand:onAreaAnalysisSector(results, meta, x, y)
 end
 
+-- Gate topology is derived from the server seed and never changes, so both the map and its
+-- connection lookups are memoised for the whole session. GatesMap:getConnectedSectors scans
+-- a 181x181 sector window per call, which is far too expensive to repeat on every remap.
+local cachedGatesMap
+local gateNeighbourCache = {}
+
+local function getGatesMap()
+    if not cachedGatesMap then
+        local ok, map = pcall(function() return GatesMap(Server().seed) end)
+        if ok then cachedGatesMap = map end
+    end
+
+    return cachedGatesMap
+end
+
+-- Player-built gates are invisible to GatesMap, which only knows the seeded network. The
+-- gate-construction mod publishes its active links as a server value ("ax:ay>bx:by" joined
+-- by ";"); reading it directly keeps this mod usable on its own. Unlike the seeded network
+-- these links appear at runtime, so they are re-read whenever the raw value changes.
+local BuiltGateLinksKey = "gate_construction_links"
+local builtGateLinks = {}
+local builtGateLinksRaw
+
+local function refreshBuiltGateLinks()
+    local ok, raw = pcall(function() return Server():getValue(BuiltGateLinksKey) end)
+    raw = (ok and type(raw) == "string") and raw or ""
+
+    if raw == builtGateLinksRaw then return end
+    builtGateLinksRaw = raw
+    builtGateLinks = {}
+
+    local function link(fromKey, x, y)
+        local neighbours = builtGateLinks[fromKey]
+        if not neighbours then
+            neighbours = {}
+            builtGateLinks[fromKey] = neighbours
+        end
+        table.insert(neighbours, {x = x, y = y})
+    end
+
+    for entry in string.gmatch(raw, "[^;]+") do
+        local ax, ay, bx, by = string.match(entry, "^(%-?%d+):(%-?%d+)>(%-?%d+):(%-?%d+)$")
+        if ax then
+            ax, ay, bx, by = tonumber(ax), tonumber(ay), tonumber(bx), tonumber(by)
+            link(skey(ax, ay), bx, by)
+            link(skey(bx, by), ax, ay)
+        end
+    end
+end
+
+local function gateNeighbours(x, y)
+    local gatesMap = getGatesMap()
+    if not gatesMap then return builtGateLinks[skey(x, y)] or {} end
+
+    local key = skey(x, y)
+    local cached = gateNeighbourCache[key]
+
+    if not cached then
+        cached = {}
+        local ok, connected = pcall(gatesMap.getConnectedSectors, gatesMap, {x = x, y = y})
+        if ok and connected then
+            for _, coord in pairs(connected) do
+                table.insert(cached, {x = coord.x, y = coord.y})
+            end
+        end
+
+        gateNeighbourCache[key] = cached
+    end
+
+    local built = builtGateLinks[key]
+    if not built then return cached end
+
+    -- the BFS already de-duplicates, so a link that mirrors a seeded gate is harmless
+    local merged = {}
+    for _, coord in pairs(cached) do table.insert(merged, coord) end
+    for _, coord in pairs(built) do table.insert(merged, coord) end
+
+    return merged
+end
+
 -- BFS over the gate network from the anchor sector, bounded to MaxGateJumps.
 -- Returns the reachable set, a gate-predecessor map (cameFrom[key] points one hop
 -- closer to the anchor), and gate depths.
@@ -814,6 +968,8 @@ local function computeReachableRegion(owner, originX, originY)
     local cameFrom = {}
     local gateDepth = {}
     local count = 0
+
+    refreshBuiltGateLinks()
 
     local function blockedByWar(x, y)
         local faction = Galaxy():getControllingFaction(x, y)
@@ -832,8 +988,7 @@ local function computeReachableRegion(owner, originX, originY)
     add(originX, originY)
 
     -- bounded gate flood fill up to MaxGateJumps.
-    local ok, gatesMap = pcall(function() return GatesMap(Server().seed) end)
-    if ok and gatesMap then
+    do
         local originKey = skey(originX, originY)
         local gateVisited = {[originKey] = true}
         gateDepth[originKey] = 0
@@ -845,11 +1000,7 @@ local function computeReachableRegion(owner, originX, originY)
             local nextFrontier = {}
 
             for _, sector in pairs(frontier) do
-                local connected = {}
-                local okc, res = pcall(function() return gatesMap:getConnectedSectors(sector) end)
-                if okc and res then connected = res end
-
-                for _, coord in pairs(connected) do
+                for _, coord in pairs(gateNeighbours(sector.x, sector.y)) do
                     local key = skey(coord.x, coord.y)
                     if not gateVisited[key] and not blockedByWar(coord.x, coord.y) then
                         gateVisited[key] = true
@@ -871,11 +1022,111 @@ local function computeReachableRegion(owner, originX, originY)
     return reachable, cameFrom, gateDepth
 end
 
+-- Reading a station's secured script values deserialises its whole trading state, so the
+-- parsed offer is cached briefly and dropped wholesale once it ages out. Every running
+-- command remaps in the same simulation tick and would otherwise repeat the same scan.
+local stationTradeCache = {}
+local stationTradeCacheTime
+
+local function beginStationScan()
+    local ok, runtime = pcall(function() return Server().unpausedRuntime end)
+
+    if not ok or not stationTradeCacheTime or runtime - stationTradeCacheTime >= StationTradeCacheSeconds then
+        stationTradeCache = {}
+        stationTradeCacheTime = ok and runtime or nil
+    end
+end
+
+local function readStationTrade(entry, cacheKey, tradeScripts)
+    local cached = stationTradeCache[cacheKey]
+    if cached ~= nil then return cached or nil end
+
+    local scripts = entry:getScripts()
+    local secured = entry:getSecuredScriptValues()
+
+    local buys = {}
+    local sells = {}
+    local hasTrade = false
+    local pickupEnabled  = true
+    local deliveryEnabled = true
+
+    for i, script in pairs(scripts) do
+        local isTrade = false
+        for _, tradeScript in pairs(tradeScripts) do
+            if string.ends(script, tradeScript) then
+                isTrade = true
+                break
+            end
+        end
+
+        if isTrade then
+            local values = secured[i] or {}
+
+            -- read stock-hauler opt-out flags (default enabled when absent)
+            local pf = values.stockHaulerPickupEnabled
+            if pf ~= nil then pickupEnabled  = pickupEnabled  and pf end
+            local df = values.stockHaulerDeliveryEnabled
+            if df ~= nil then deliveryEnabled = deliveryEnabled and df end
+
+            local soldGoods = values.soldGoods
+            if not soldGoods and values.tradingData then soldGoods = values.tradingData.soldGoods end
+
+            local boughtGoods = values.boughtGoods
+            if not boughtGoods and values.tradingData then boughtGoods = values.tradingData.boughtGoods end
+
+            for _, good in pairs(soldGoods or {}) do
+                sells[good.name] = script
+                hasTrade = true
+            end
+
+            for _, good in pairs(boughtGoods or {}) do
+                buys[good.name] = script
+                hasTrade = true
+            end
+
+            -- factory.lua stores the production recipe even before first output;
+            -- use it so an empty-but-configured factory still appears as a source
+            if values.production then
+                for _, result in pairs(values.production.results or {}) do
+                    if result.name and not sells[result.name] then
+                        sells[result.name] = script
+                        hasTrade = true
+                    end
+                end
+                for _, garbage in pairs(values.production.garbages or {}) do
+                    if garbage.name and not sells[garbage.name] then
+                        sells[garbage.name] = script
+                        hasTrade = true
+                    end
+                end
+                for _, ingredient in pairs(values.production.ingredients or {}) do
+                    if ingredient.name and not buys[ingredient.name] then
+                        buys[ingredient.name] = script
+                        hasTrade = true
+                    end
+                end
+            end
+        end
+    end
+
+    local trade = hasTrade and {
+        buys = buys,
+        sells = sells,
+        stockHaulerPickupEnabled   = pickupEnabled,
+        stockHaulerDeliveryEnabled = deliveryEnabled,
+    } or false
+
+    stationTradeCache[cacheKey] = trade
+    return trade or nil
+end
+
 -- gathers the owner's stations that trade goods, with their buy/sell trade scripts
 local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
     local tradeScripts = TradingUtility.getTradeableScripts()
     local stations = {}
     local seenStations = {}
+
+    beginStationScan()
 
     local factions = {}
     local factionSeen = {}
@@ -914,81 +1165,15 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
                     goto continue
                 end
 
-                local scripts = entry:getScripts()
-                local secured = entry:getSecuredScriptValues()
+                local trade = readStationTrade(entry, stationKey, tradeScripts)
 
-                local buys = {}
-                local sells = {}
-                local hasTrade = false
-                local pickupEnabled  = true
-                local deliveryEnabled = true
-
-                for i, script in pairs(scripts) do
-                    local isTrade = false
-                    for _, tradeScript in pairs(tradeScripts) do
-                        if string.ends(script, tradeScript) then
-                            isTrade = true
-                            break
-                        end
-                    end
-
-                    if isTrade then
-                        local values = secured[i] or {}
-
-                        -- read stock-hauler opt-out flags (default enabled when absent)
-                        local pf = values.stockHaulerPickupEnabled
-                        if pf ~= nil then pickupEnabled  = pickupEnabled  and pf end
-                        local df = values.stockHaulerDeliveryEnabled
-                        if df ~= nil then deliveryEnabled = deliveryEnabled and df end
-
-                        local soldGoods = values.soldGoods
-                        if not soldGoods and values.tradingData then soldGoods = values.tradingData.soldGoods end
-
-                        local boughtGoods = values.boughtGoods
-                        if not boughtGoods and values.tradingData then boughtGoods = values.tradingData.boughtGoods end
-
-                        for _, good in pairs(soldGoods or {}) do
-                            sells[good.name] = script
-                            hasTrade = true
-                        end
-
-                        for _, good in pairs(boughtGoods or {}) do
-                            buys[good.name] = script
-                            hasTrade = true
-                        end
-
-                        -- factory.lua stores the production recipe even before first output;
-                        -- use it so an empty-but-configured factory still appears as a source
-                        if values.production then
-                            for _, result in pairs(values.production.results or {}) do
-                                if result.name and not sells[result.name] then
-                                    sells[result.name] = script
-                                    hasTrade = true
-                                end
-                            end
-                            for _, garbage in pairs(values.production.garbages or {}) do
-                                if garbage.name and not sells[garbage.name] then
-                                    sells[garbage.name] = script
-                                    hasTrade = true
-                                end
-                            end
-                            for _, ingredient in pairs(values.production.ingredients or {}) do
-                                if ingredient.name and not buys[ingredient.name] then
-                                    buys[ingredient.name] = script
-                                    hasTrade = true
-                                end
-                            end
-                        end
-                    end
-                end
-
-                if hasTrade then
+                if trade then
                     seenStations[stationKey] = true
                     table.insert(stations, {
                         name = name, factionIndex = faction.index, x = x, y = y,
-                        buys = buys, sells = sells,
-                        stockHaulerPickupEnabled   = pickupEnabled,
-                        stockHaulerDeliveryEnabled = deliveryEnabled,
+                        buys = trade.buys, sells = trade.sells,
+                        stockHaulerPickupEnabled   = trade.stockHaulerPickupEnabled,
+                        stockHaulerDeliveryEnabled = trade.stockHaulerDeliveryEnabled,
                     })
                 end
             end
@@ -1043,31 +1228,35 @@ end
 ---------------------------------------------------------------------
 
 -- true if at least one good can still be sourced from a reachable owned supplier
-function StockFactoryCommand:hasAnyReachableSource(regionGoods)
-    for good, _ in pairs(regionGoods or allStationGoods(self.data.stations)) do
-        for _, target in pairs(self:eligibleTargets(good)) do
-            if #self:eligibleSources(good, target) > 0 then
-                return true
-            end
+function StockFactoryCommand:hasAnyReachableSource(index)
+    index = index or buildRouteIndex(self.data.stations, self.config)
+
+    for _, entry in pairs(index) do
+        if #entry.targets > 0 and #entry.sources > 0 then
+            return true
         end
     end
+
     return false
 end
 
 -- returns true when at least one consumer exists for any eligible good
-function StockFactoryCommand:hasAnyConsumer(regionGoods)
-    for good, _ in pairs(regionGoods or allStationGoods(self.data.stations)) do
-        if #self:eligibleTargets(good) > 0 then
+function StockFactoryCommand:hasAnyConsumer(index)
+    index = index or buildRouteIndex(self.data.stations, self.config)
+
+    for _, entry in pairs(index) do
+        if #entry.targets > 0 then
             return true
         end
     end
+
     return false
 end
 
 -- re-scan owned stations and recompute the reachable region + gate route from the
 -- target, so the command follows the galaxy over time (gates turning hostile,
--- suppliers built or destroyed). If nothing can be reached any more the ship can't
--- keep the order, so it is stopped and recalled.
+-- suppliers built or destroyed). Finding nothing is not a failure: the ship stays
+-- assigned and idles until a route appears.
 function StockFactoryCommand:remapRoute()
     local owner = getParentFaction()
     local anchor = self.data.anchor
@@ -1088,14 +1277,6 @@ function StockFactoryCommand:remapRoute()
     self.data.gateCameFrom = gateCameFrom
     self.data.gateDepth = gateDepth
     self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
-
-    local regionGoods = allStationGoods(self.data.stations)
-
-    if not self:hasAnyConsumer(regionGoods) then
-        self:setRuntimeError("Commander, no station in the anchor region buys anything I'm allowed to haul any more. Recalling."%_T)
-    elseif not self:hasAnyReachableSource(regionGoods) then
-        self:setRuntimeError("Commander, no producer I'm allowed to haul from is still reachable from the anchor region. Recalling."%_T)
-    end
 end
 
 
@@ -1229,6 +1410,10 @@ function StockFactoryCommand:getDescriptionText()
 end
 
 function StockFactoryCommand:getStatusMessage()
+    if self.data and self.data.phase == "idle" and not self.data.currentHaul then
+        return "Waiting for goods to haul /* ship AI status */"%_T
+    end
+
     return "Stocking a sector /* ship AI status */"%_T
 end
 
@@ -1246,17 +1431,10 @@ function StockFactoryCommand:getRecallError()
     end
 end
 
+-- A hauler can always be assigned: stations get built, destroyed and reconfigured while the
+-- command runs, so an empty route right now says nothing about the next re-scan. The ship
+-- idles in the anchor region until a producer/consumer pair shows up.
 function StockFactoryCommand:getErrors(ownerIndex, shipName, area, config)
-    local prediction = self:calculatePrediction(ownerIndex, shipName, area, config)
-
-    if prediction.numGoodsWithConsumer == 0 then
-        return "No consumer stations were found in the anchor region (up to 5 gate jumps). Add a station that buys goods."%_t
-    end
-
-    if prediction.numGoodsWithSource == 0 then
-        return "No producer-to-consumer route was found for any good I'm allowed to haul."%_t
-    end
-
     return
 end
 
@@ -1298,53 +1476,38 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     local analysis = area.analysis or {}
     local stations = analysis.stations or {}
 
+    local index = buildRouteIndex(stations, config)
+
     local producerStations = {}
     local consumerStations = {}
-    local goodsWithSource = {}
-    local goodsWithConsumer = {}
+    local numGoodsWithSource = 0
+    local numGoodsWithConsumer = 0
 
-    for good, _ in pairs(allStationGoods(stations)) do
-        if isGoodIgnored(config, good) then goto continue end
-
-        -- count producers independently: any station that sells but doesn't also buy this good
-        for _, source in pairs(stations) do
-            if source.sells and source.sells[good]
-                and not (source.buys and source.buys[good])
-                and source.stockHaulerPickupEnabled ~= false then
-                local srckey = (source.factionIndex or 0) .. ":" .. source.name
-                producerStations[srckey] = true
-            end
+    for _, entry in pairs(index) do
+        for _, source in pairs(entry.sources) do
+            producerStations[(source.factionIndex or 0) .. ":" .. source.name] = true
         end
 
-        -- count consumers independently, and check for complete pairs
-        local hasPair = false
-        for _, target in pairs(stations) do
-            if target.buys and target.buys[good]
-                and target.stockHaulerDeliveryEnabled ~= false then
-                goodsWithConsumer[good] = true
-                local tkey = (target.factionIndex or 0) .. ":" .. target.name
-                consumerStations[tkey] = true
-                for _, source in pairs(stations) do
-                    if not (source.name == target.name and source.factionIndex == target.factionIndex)
-                        and source.sells and source.sells[good]
-                        and not (source.buys and source.buys[good])
-                        and source.stockHaulerPickupEnabled ~= false then
-                        hasPair = true
-                    end
-                end
+        if #entry.targets > 0 then
+            numGoodsWithConsumer = numGoodsWithConsumer + 1
+
+            for _, target in pairs(entry.targets) do
+                consumerStations[(target.factionIndex or 0) .. ":" .. target.name] = true
+            end
+
+            -- sources and targets are disjoint, so any of each is already a valid pair
+            if #entry.sources > 0 then
+                numGoodsWithSource = numGoodsWithSource + 1
             end
         end
-        if hasPair then goodsWithSource[good] = true end
-
-        ::continue::
     end
 
     prediction.producers.value = tablelength(producerStations)
     prediction.consumers.value = tablelength(consumerStations)
     prediction.producerCount = prediction.producers.value
     prediction.consumerCount = prediction.consumers.value
-    prediction.numGoodsWithSource = tablelength(goodsWithSource)
-    prediction.numGoodsWithConsumer = tablelength(goodsWithConsumer)
+    prediction.numGoodsWithSource = numGoodsWithSource
+    prediction.numGoodsWithConsumer = numGoodsWithConsumer
 
     return prediction
 end
@@ -1355,7 +1518,8 @@ function StockFactoryCommand:generateAssessmentFromPrediction(prediction, captai
         table.insert(intro, "We can stock your anchor region, Commander. I know where to move those goods."%_t)
         table.insert(intro, "Leave the logistics to me. I'll keep those sector stations supplied."%_t)
     else
-        table.insert(intro, "I can't find producer and consumer stations for those goods in the anchor region."%_t)
+        table.insert(intro, "I don't see anything to haul in the anchor region yet, Commander. I'll hold position and keep looking."%_t)
+        table.insert(intro, "No routes there for now. Assign me anyway and I'll start hauling as soon as your stations line up."%_t)
     end
 
     local autonomy = {}
