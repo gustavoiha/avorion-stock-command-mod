@@ -51,6 +51,13 @@ local StationTradeCacheSeconds = 10
 -- never strand the ship (Simulation.forceRecall silently aborts on a recall error)
 local RecallBlockSeconds = 30
 
+-- A source that turned out empty, or a target that turned out full, is remembered for a
+-- while: rediscovering it costs a full travel leg plus two sector loads every time.
+local RecentFailureSeconds = 10 * 60
+local MaxRecentFailures = 64
+local MaxPlanAttempts = 12
+local BlockedPlanRetrySeconds = 60
+
 
 ---------------------------------------------------------------------
 -- small helpers
@@ -70,6 +77,10 @@ end
 
 local function skey(x, y)
     return x .. ":" .. y
+end
+
+local function failureKey(kind, good, station)
+    return kind .. "|" .. good .. "|" .. tostring(station.factionIndex) .. "|" .. station.name .. "@" .. skey(station.x, station.y)
 end
 
 -- all eligible goods present across any station in the list (union of buys and sells)
@@ -223,11 +234,42 @@ function StockFactoryCommand:onStart()
     entry:setStatusMessage("Stocking a sector"%_T)
 end
 
+-- The lease is what the asynchronous sector jobs check before they touch any cargo. Writing
+-- it in onStart is not enough: the ship is still a live entity in its sector then, and the
+-- entity's own values overwrite the database entry when it drops into background simulation
+-- (see the ShipDatabaseEntry docs). update() only ever runs once the ship is in the
+-- background, so the lease is re-asserted from there and verified by reading it back.
+function StockFactoryCommand:ensureCommandLease()
+    local owner = getParentFaction()
+    if not owner or not self.data.commandToken then return false end
+
+    local entry = ShipDatabaseEntry(owner.index, self.shipName)
+    if not valid(entry) then return false end
+
+    if entry:getScriptValue(CommandLeaseKey) ~= self.data.commandToken then
+        entry:setScriptValue(CommandLeaseKey, self.data.commandToken)
+
+        if entry:getScriptValue(CommandLeaseKey) ~= self.data.commandToken then
+            if not self.data.reportedLeaseFailure then
+                self.data.reportedLeaseFailure = true
+                print(string.format("StockFactory: '%s' cannot hold a command lease - transfers will never run",
+                    tostring(self.shipName)))
+            end
+            return false
+        end
+    end
+
+    self.data.reportedLeaseFailure = nil
+    return true
+end
+
 function StockFactoryCommand:update(timeStep)
     if self.finishOnNextUpdate then
         self:finish()
         return
     end
+
+    self:ensureCommandLease()
 
     -- periodically re-scan the reachable suppliers + gate route so the command
     -- follows the galaxy (gates turning hostile, suppliers built or destroyed).
@@ -242,6 +284,7 @@ function StockFactoryCommand:update(timeStep)
         end
     end
 
+    self.data.clock = (self.data.clock or 0) + timeStep
     self.data.timer = (self.data.timer or 0) + timeStep
 
     local phase = self.data.phase or "idle"
@@ -288,6 +331,12 @@ function StockFactoryCommand:update(timeStep)
         -- so replaying the leg can't duplicate goods. Only give up after repeated timeouts.
         if self.data.timer >= TransactionTimeout then
             self.data.transactionTimeouts = (self.data.transactionTimeouts or 0) + 1
+
+            local tr = self.data.transaction or {}
+            print(string.format("StockFactory: '%s' transfer timeout %i in %s - transaction #%s stage '%s', good '%s', target reply %s, source reply %s",
+                tostring(self.shipName), self.data.transactionTimeouts, phase,
+                tostring(tr.id), tostring(tr.stage), tostring(tr.good),
+                tostring(tr.targetReceived), tostring(tr.sourceReceived)))
 
             if self.data.transactionTimeouts > MaxTransactionTimeouts then
                 self:setRuntimeError("Commander, the stock transfer keeps timing out. I'm aborting with any collected cargo still in the hold."%_T)
@@ -420,10 +469,64 @@ function StockFactoryCommand:estimateTravelTime()
     return random():getInt(MinTravelMinutes, MaxTravelMinutes) * 60
 end
 
+-- Remembers that a station was useless for a good, so the next plan can skip it. `kind` is
+-- "source" (had no stock) or "target" (had no room).
+function StockFactoryCommand:noteHaulFailure(kind, good, station)
+    if not good or not station or not station.name then return end
+
+    local failures = self.data.recentFailures
+    if not failures then
+        failures = {}
+        self.data.recentFailures = failures
+    end
+
+    failures[failureKey(kind, good, station)] = (self.data.clock or 0) + RecentFailureSeconds
+end
+
+-- Drops expired entries and returns what is left, or nil when there is nothing to avoid.
+-- The whole table is discarded if it ever grows past the cap: every entry is only a hint,
+-- and it is persisted with the command.
+function StockFactoryCommand:pruneHaulFailures()
+    local failures = self.data.recentFailures
+    if not failures then return nil end
+
+    local now = self.data.clock or 0
+    local remaining = 0
+
+    for key, expiry in pairs(failures) do
+        if expiry <= now then
+            failures[key] = nil
+        else
+            remaining = remaining + 1
+        end
+    end
+
+    if remaining == 0 or remaining > MaxRecentFailures then
+        self.data.recentFailures = nil
+        return nil
+    end
+
+    return failures
+end
+
+-- One uniformly random (good, source, target) triple. Sources and targets are disjoint per
+-- good, so a good contributes exactly #targets * #sources pairs and the triple can be
+-- addressed by index instead of materialising every combination.
+local function pickHaulTriple(index, total)
+    local pick = random():getInt(1, total)
+
+    for good, entry in pairs(index) do
+        local pairsForGood = #entry.targets * #entry.sources
+        if pick <= pairsForGood then
+            return good,
+                entry.sources[(pick - 1) % #entry.sources + 1],
+                entry.targets[math.floor((pick - 1) / #entry.sources) + 1]
+        end
+        pick = pick - pairsForGood
+    end
+end
+
 function StockFactoryCommand:planNextHaul()
-    -- Choose one (good, source, target) triple uniformly at random so the route order is
-    -- not predictable, without building every triple: sources and targets are disjoint per
-    -- good, so a good contributes exactly #targets * #sources pairs.
     local index = buildRouteIndex(self.data.stations, self.config)
 
     local total = 0
@@ -432,18 +535,30 @@ function StockFactoryCommand:planNextHaul()
     end
 
     if total > 0 then
-        local pick = random():getInt(1, total)
+        local failures = self:pruneHaulFailures()
         local good, source, target
 
-        for name, entry in pairs(index) do
-            local pairsForGood = #entry.targets * #entry.sources
-            if pick <= pairsForGood then
-                good = name
-                target = entry.targets[math.floor((pick - 1) / #entry.sources) + 1]
-                source = entry.sources[(pick - 1) % #entry.sources + 1]
+        -- Rejection sampling: recently failed stations are a small slice of the space, so
+        -- redrawing is cheaper than counting the viable pairs on every plan.
+        for _ = 1, MaxPlanAttempts do
+            good, source, target = pickHaulTriple(index, total)
+            if not good then break end
+
+            if not failures
+                or not (failures[failureKey("source", good, source)]
+                    or failures[failureKey("target", good, target)]) then
                 break
             end
-            pick = pick - pairsForGood
+
+            good = nil
+        end
+
+        if not good then
+            -- everything drawn was a station we just found empty or full; waiting beats
+            -- spending another travel leg confirming it
+            self.data.phase = "idle"
+            self.data.rescanCooldown = BlockedPlanRetrySeconds
+            return
         end
 
         local travelTime = self:estimateTravelTime()
@@ -548,8 +663,15 @@ local StockFactoryUtility = include("stockfactoryutility")
 
 function run(faction, shipName, stationFaction, stationName, script, goodName, callback, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) then return end -- command will be cancelled anyway
-    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
+    if not valid(ship) then
+        print(string.format("StockFactory: probe for '%s' aborted - no ship database entry", tostring(shipName)))
+        return
+    end
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then
+        print(string.format("StockFactory: probe for '%s' aborted - lease mismatch (entry '%s', command '%s')",
+            tostring(shipName), tostring(ship:getScriptValue("stock_factory_command_lease")), tostring(commandToken)))
+        return
+    end
 
     local owner = Galaxy():findFaction(faction)
     if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
@@ -582,8 +704,15 @@ local StockFactoryUtility = include("stockfactoryutility")
 
 function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) then return end
-    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
+    if not valid(ship) then
+        print(string.format("StockFactory: pickup for '%s' aborted - no ship database entry", tostring(shipName)))
+        return
+    end
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then
+        print(string.format("StockFactory: pickup for '%s' aborted - lease mismatch (entry '%s', command '%s')",
+            tostring(shipName), tostring(ship:getScriptValue("stock_factory_command_lease")), tostring(commandToken)))
+        return
+    end
 
     local owner = Galaxy():findFaction(faction)
     if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
@@ -619,8 +748,15 @@ local StockFactoryUtility = include("stockfactoryutility")
 
 function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId, callingPlayer)
     local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) then return end
-    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
+    if not valid(ship) then
+        print(string.format("StockFactory: delivery for '%s' aborted - no ship database entry", tostring(shipName)))
+        return
+    end
+    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then
+        print(string.format("StockFactory: delivery for '%s' aborted - lease mismatch (entry '%s', command '%s')",
+            tostring(shipName), tostring(ship:getScriptValue("stock_factory_command_lease")), tostring(commandToken)))
+        return
+    end
 
     local owner = Galaxy():findFaction(faction)
     if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
@@ -675,6 +811,8 @@ function StockFactoryCommand:beginPickupTransaction()
     local t = haul.target
     local s = haul.source
 
+    if not self:ensureCommandLease() then return end
+
     if not StockFactoryUtility.canUseStation(owner, t.factionIndex, self.data.callingPlayer)
         or not StockFactoryUtility.canUseStation(owner, s.factionIndex, self.data.callingPlayer) then
         self:setRuntimeError("Commander, I no longer have permission to manage one of the stations on this route."%_T)
@@ -683,6 +821,10 @@ function StockFactoryCommand:beginPickupTransaction()
 
     if not t.script or not s.script then
         -- we don't know which scripts trade the good; skip this haul
+        print(string.format("StockFactory: '%s' dropped %s - no trading script (source '%s' %s, target '%s' %s)",
+            tostring(self.shipName), tostring(haul.good),
+            tostring(s.name), tostring(s.script), tostring(t.name), tostring(t.script)))
+
         self.data.currentHaul = nil
         self.data.phase = "idle"
         self.data.rescanCooldown = 30
@@ -720,6 +862,11 @@ function StockFactoryCommand:beginPickupTransaction()
     runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock", self.data.commandToken, transactionId, self.data.callingPlayer)
     runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock", self.data.commandToken, transactionId, self.data.callingPlayer)
 
+    print(string.format("StockFactory: '%s' probing #%i for %s - source '%s' (%i:%i, %s), target '%s' (%i:%i, %s)",
+        tostring(self.shipName), transactionId, tostring(haul.good),
+        tostring(s.name), s.x, s.y, tostring(s.script),
+        tostring(t.name), t.x, t.y, tostring(t.script)))
+
     self.data.phase = "transactingPickup"
     self.data.timer = 0
 end
@@ -728,6 +875,8 @@ function StockFactoryCommand:beginDeliveryTransaction()
     local haul = self.data.currentHaul
     local owner = getParentFaction()
     if not haul or not owner then return end
+
+    if not self:ensureCommandLease() then return end
 
     local amount = haul.carriedAmount or 0
     if amount <= 0 then
@@ -758,13 +907,38 @@ function StockFactoryCommand:beginDeliveryTransaction()
     self.data.transaction = {id = transactionId, stage = "delivering", good = haul.good, amount = amount}
     runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, haul.good, amount, self.data.commandToken, transactionId, self.data.callingPlayer)
 
+    print(string.format("StockFactory: '%s' delivering #%i - %i units of %s to '%s' (%i:%i)",
+        tostring(self.shipName), transactionId, amount, tostring(haul.good), tostring(t.name), t.x, t.y))
+
     self.data.phase = "transactingDelivery"
     self.data.timer = 0
 end
 
-function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock)
+-- Replies arrive from a queued sector job, so they can be stale. Anything that doesn't match
+-- the in-flight transaction is dropped -- and logged, because a dropped reply is invisible
+-- otherwise and shows up much later as a transfer timeout.
+function StockFactoryCommand:acceptStockReport(commandToken, transactionId, good)
     local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "probing" then return end
+    local reason
+
+    if self.data.commandToken ~= commandToken then reason = "lease token changed"
+    elseif not transaction then reason = "no transaction in flight"
+    elseif transaction.id ~= transactionId then reason = string.format("transaction %i, expected %i", transactionId or -1, transaction.id or -1)
+    elseif transaction.good ~= good then reason = string.format("good '%s', expected '%s'", tostring(good), tostring(transaction.good))
+    elseif transaction.stage ~= "probing" then reason = string.format("stage '%s', expected 'probing'", tostring(transaction.stage))
+    end
+
+    if reason then
+        print(string.format("StockFactory: '%s' dropped a stock report - %s", tostring(self.shipName), reason))
+        return nil
+    end
+
+    return transaction
+end
+
+function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock)
+    local transaction = self:acceptStockReport(commandToken, transactionId, good)
+    if not transaction then return end
     transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
     transaction.targetReceived = true
 
@@ -772,8 +946,8 @@ function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good
 end
 
 function StockFactoryCommand:reportSourceStock(commandToken, transactionId, good, stock, maxStock)
-    local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "probing" then return end
+    local transaction = self:acceptStockReport(commandToken, transactionId, good)
+    if not transaction then return end
     transaction.sourceStock = stock or 0
     transaction.sourceReceived = true
 
@@ -811,6 +985,9 @@ function StockFactoryCommand:tryExecuteHaul()
             tostring(self.shipName), tostring(good), tostring(haul.source.name), tostring(haul.target.name),
             tr.targetRoom or 0, tr.sourceStock or 0, cargoUnits))
 
+        if (tr.sourceStock or 0) <= 0 then self:noteHaulFailure("source", good, haul.source) end
+        if (tr.targetRoom or 0) <= 0 then self:noteHaulFailure("target", good, haul.target) end
+
         self.data.currentHaul = nil
         self.data.transaction = nil
         self.data.phase = "idle"
@@ -835,6 +1012,7 @@ function StockFactoryCommand:onGoodsRemoved(commandToken, transactionId, good, r
     if (removed or 0) <= 0 then
         -- source was empty at pickup time (produced nothing yet)
         -- retry with a different random pair soon
+        self:noteHaulFailure("source", good, haul.source)
         self.data.currentHaul = nil
         self.data.phase = "idle"
         self.data.rescanCooldown = 5

@@ -152,6 +152,55 @@ check("an idle hauler reports that it is waiting",
 check("a hauling ship reports that it is stocking",
     planner:getStatusMessage() == "Stocking a sector /* ship AI status */")
 
+print("\n[recent failure memory]")
+
+local function freshPlanner()
+    local instance = Factory("Hauler", area, {ignoredGoods = {}})
+    instance.data.stations = pairedStations()
+    return instance
+end
+
+local emptySource = freshPlanner()
+emptySource.data.currentHaul = {good = "Iron", source = emptySource.data.stations[1], target = emptySource.data.stations[2]}
+emptySource.data.transaction = {id = 1, stage = "probing", good = "Iron", targetReceived = true, sourceReceived = true, targetRoom = 500, sourceStock = 0}
+emptySource:tryExecuteHaul()
+check("an empty source is remembered", tablelength(emptySource.data.recentFailures) == 1)
+emptySource:planNextHaul()
+check("a remembered empty source is not picked again",
+    emptySource.data.phase == "idle" and emptySource.data.currentHaul == nil)
+
+local fullTarget = freshPlanner()
+fullTarget.data.currentHaul = {good = "Iron", source = fullTarget.data.stations[1], target = fullTarget.data.stations[2]}
+fullTarget.data.transaction = {id = 1, stage = "probing", good = "Iron", targetReceived = true, sourceReceived = true, targetRoom = 0, sourceStock = 900}
+fullTarget:tryExecuteHaul()
+check("a full target is remembered", tablelength(fullTarget.data.recentFailures) == 1)
+fullTarget:planNextHaul()
+check("a remembered full target is not picked again",
+    fullTarget.data.phase == "idle" and fullTarget.data.currentHaul == nil)
+check("a blocked plan retries sooner than a dry galaxy", fullTarget.data.rescanCooldown == 60)
+
+local pickupFailure = freshPlanner()
+pickupFailure.data.commandToken = "current-command"
+pickupFailure.data.currentHaul = {good = "Iron", source = pickupFailure.data.stations[1], target = pickupFailure.data.stations[2]}
+pickupFailure.data.transaction = {id = 7, stage = "removing", good = "Iron"}
+pickupFailure:onGoodsRemoved("current-command", 7, "Iron", 0)
+check("a source that hands over nothing is remembered", tablelength(pickupFailure.data.recentFailures) == 1)
+
+local expiring = freshPlanner()
+expiring:noteHaulFailure("source", "Iron", expiring.data.stations[1])
+expiring.data.clock = 10 * 60
+check("a failure expires and is forgotten", expiring:pruneHaulFailures() == nil)
+expiring:planNextHaul()
+check("an expired failure no longer blocks the pair",
+    expiring.data.phase == "haulingToSource" and expiring.data.currentHaul.good == "Iron")
+
+local overflowing = freshPlanner()
+overflowing.data.recentFailures = {}
+for entry = 1, 65 do
+    overflowing.data.recentFailures["stale" .. entry] = 10 * 60
+end
+check("an oversized failure table is discarded wholesale", overflowing:pruneHaulFailures() == nil)
+
 print("\n[assignment]")
 local empty = Factory("Hauler", {lower = {x = 0, y = 0}, upper = {x = 0, y = 0}, analysis = {}}, {ignoredGoods = {}})
 check("a hauler can be assigned with no stations in range",
