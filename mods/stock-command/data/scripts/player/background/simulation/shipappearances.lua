@@ -25,84 +25,40 @@ AppearanceLengths[CommandType.StockFactory] = 6
 
 if onServer() then
 
--- collect the sectors a stocking ferry actually works between: the target station
--- and every owned trading station it might pick goods up from (read straight from
--- the running command's saved data)
-local function stockFactoryRouteSectors(shipName)
-    local result = {}
-    local seen = {}
-
-    if not Simulation then return result end
-
-    local function addSector(x, y)
-        if not x or not y then return end
-        local key = x .. ":" .. y
-        if not seen[key] then
-            seen[key] = true
-            table.insert(result, {x = x, y = y})
-        end
-    end
+-- The ferry AI only ever docks the station of the leg it is currently flying
+-- (ai/stockfactoryferry.lua treats every other sector as a transit hop and leaves again
+-- immediately), so the appearance has to be placed in exactly that sector. An idle command
+-- has no leg and therefore no place to be seen.
+local function stockFactoryDockSector(shipName)
+    if not Simulation then return end
 
     for _, command in pairs(Simulation.commands) do
         if command.shipName == shipName and command.data then
-            local anchor = command.data.anchor
-            if anchor then addSector(anchor.x, anchor.y) end
-
             local haul = command.data.currentHaul
-            if haul then
-                local phase = command.data.phase
-                if phase == "haulingToSource" or phase == "transactingPickup" then
-                    if haul.source then addSector(haul.source.x, haul.source.y) end
-                    if haul.target then addSector(haul.target.x, haul.target.y) end
-                elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
-                    if haul.target then addSector(haul.target.x, haul.target.y) end
-                    if haul.source then addSector(haul.source.x, haul.source.y) end
-                else
-                    if haul.source then addSector(haul.source.x, haul.source.y) end
-                    if haul.target then addSector(haul.target.x, haul.target.y) end
-                end
+            if not haul then return end
+
+            local phase = command.data.phase
+            local stop
+
+            if phase == "haulingToSource" or phase == "transactingPickup" then
+                stop = haul.source
+            elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
+                stop = haul.target
             end
 
-            for _, station in pairs(command.data.stations or {}) do
-                addSector(station.x, station.y)
-            end
-
-            break
+            if stop and stop.x and stop.y then return stop.x, stop.y end
+            return
         end
     end
-
-    return result
 end
 
--- Bias the ferry so it appears where it can actually be watched docking, instead
--- of at a random reachable sector. Everything that isn't a Stock Factory ferry
--- (and the fallback when we have no route) keeps the vanilla behaviour.
+-- Put the ferry where it can actually be watched flying in and docking, instead of at a
+-- random reachable sector. Anything that isn't a Stock Factory ferry keeps vanilla
+-- behaviour; returning nil makes vanilla skip the appearance entirely this tick.
 local stockFactoryOriginalFindLocation = ShipAppearances.findLocation
 function ShipAppearances.findLocation(shipName, commandType)
     if commandType == CommandType.StockFactory then
-        local route = stockFactoryRouteSectors(shipName)
-
-        if #route > 0 then
-            -- if the watching player is sitting in one of the route's sectors,
-            -- make the ferry show up right there so it's actually seen
-            if isPlayerScript() then
-                local ok, px, py = pcall(function()
-                    return Sector():getCoordinates()
-                end)
-
-                if ok and px then
-                    for _, coord in pairs(route) do
-                        if coord.x == px and coord.y == py then
-                            return px, py
-                        end
-                    end
-                end
-            end
-
-            -- otherwise pick one of the route's stations at random
-            local coord = route[random():getInt(1, #route)]
-            return coord.x, coord.y
-        end
+        return stockFactoryDockSector(shipName)
     end
 
     return stockFactoryOriginalFindLocation(shipName, commandType)

@@ -33,6 +33,11 @@ local WaitTime = 40
 -- extra distance (on top of the gate radius) that counts as "reached the gate"
 local GateReachedDistance = 250
 
+-- the route reply travels through two queued round trips (invokeFactionFunction, then
+-- runSectorCode), so the ferry holds position rather than assuming it has nowhere to dock
+local RouteReplyTimeout = 20
+local RouteRequestInterval = 5
+
 local factionIndex
 local stationId
 local exitGateId
@@ -46,10 +51,11 @@ local nextHopReady = false
 local nextHopUseGate = false
 local dockTarget
 
--- arrival bookkeeping: we hold at the spawn point for a moment so the route reply
--- can arrive and we can enter from the correct gate
+-- arrival bookkeeping: we hold at the spawn point until the command answers with our
+-- route, so a slow reply is never mistaken for "nothing to dock at here"
 local arrived = false
-local arrivalWait = 0
+local routeWait = 0
+local sinceRouteRequest = 0
 
 function getUpdateInterval()
     return 1
@@ -171,6 +177,7 @@ end
 
 function secure()
     return {
+        factionIndex = factionIndex,
         stage = stage,
         waitCount = waitCount,
         nextHop = nextHop,
@@ -182,6 +189,7 @@ end
 
 function restore(values)
     values = values or {}
+    factionIndex = values.factionIndex or factionIndex
     stage = values.stage
     waitCount = values.waitCount or 0
     nextHop = values.nextHop
@@ -280,19 +288,22 @@ function updateServer(timeStep)
         return
     end
 
-    -- arrival: give the command a moment to tell us our route, then enter from the
-    -- correct gate (falls back to the nearest gate if the reply doesn't arrive)
-    if not arrived then
-        if nextHopReady then
-            doArrival(ship)
-        else
-            arrivalWait = arrivalWait + timeStep
-            if arrivalWait >= 1.5 then
-                doArrival(ship)
-            else
-                return
-            end
+    -- arrival: hold at the spawn point until the command tells us our route, retrying the
+    -- request, then enter from the correct gate (nearest gate if the reply never lands)
+    if not nextHopReady and not arrived then
+        routeWait = routeWait + timeStep
+        sinceRouteRequest = sinceRouteRequest + timeStep
+
+        if sinceRouteRequest >= RouteRequestInterval then
+            sinceRouteRequest = 0
+            requestNextHop()
         end
+
+        if routeWait < RouteReplyTimeout then return end
+    end
+
+    if not arrived then
+        doArrival(ship)
     end
 
     stage = stage or 0

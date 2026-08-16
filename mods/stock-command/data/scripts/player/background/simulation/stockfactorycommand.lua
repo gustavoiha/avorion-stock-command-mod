@@ -36,9 +36,11 @@ local CommandLeaseKey = "stock_factory_command_lease"
 local TransactionTimeout = 300
 local MaxTransactionTimeouts = 2
 
--- loaded sectors are fully simulated, so they are only held for as long as a queued
--- runSectorCode job needs to reach its next update tick
-local SectorKeepSeconds = 30
+-- Sector loading is asynchronous and querySectors polls once per command update, i.e. once
+-- per background-simulation tick (Simulation.getUpdateInterval() == 60). This MUST stay
+-- above that interval: a shorter keep expires between two polls, so the sector is never
+-- observed loaded and the haul retries until it is abandoned.
+local SectorKeepSeconds = 90
 
 -- window in which every command that remaps in the same simulation tick shares one
 -- empire-wide station scan
@@ -469,12 +471,44 @@ function StockFactoryCommand:planNextHaul()
 
         self.data.phase = "haulingToSource"
         self.data.timer = 0
+        self.data.reportedNoRoutes = nil
         return
     end
 
     -- nothing to fetch right now: stay assigned, idle near the station, re-scan later
     self.data.phase = "idle"
     self.data.rescanCooldown = 120
+    self:reportNoRoutes(index)
+end
+
+-- Explains once (per dry spell) why the hauler is sitting still, so "nothing happens" is
+-- never silent. Reset as soon as a haul is planned.
+function StockFactoryCommand:reportNoRoutes(index)
+    if self.data.reportedNoRoutes then return end
+    self.data.reportedNoRoutes = true
+
+    local numStations = 0
+    for _ in pairs(self.data.stations or {}) do numStations = numStations + 1 end
+
+    local numConsumers, numProducers = 0, 0
+    for _, entry in pairs(index) do
+        if #entry.targets > 0 then numConsumers = numConsumers + 1 end
+        if #entry.sources > 0 then numProducers = numProducers + 1 end
+    end
+
+    print(string.format("StockFactory: '%s' idle - %i reachable owned trading stations, %i goods with a consumer, %i goods with a producer",
+        tostring(self.shipName), numStations, numConsumers, numProducers))
+
+    local owner = getParentFaction()
+    if not owner then return end
+
+    if numStations == 0 then
+        owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, I can't reach any of our trading stations from the anchor sector. Waiting here."%_T)
+    elseif numConsumers == 0 then
+        owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, none of the %1% stations I can reach buys anything I'm allowed to haul. Waiting here."%_T, numStations)
+    else
+        owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, I can reach %1% stations but found no producer for what they need. Waiting here."%_T, numStations)
+    end
 end
 
 
@@ -658,6 +692,9 @@ function StockFactoryCommand:beginPickupTransaction()
         -- sectors not loaded yet: keep trying for a while, then give up this haul
         self.data.probeRetries = (self.data.probeRetries or 0) + 1
         if self.data.probeRetries > 15 then
+            print(string.format("StockFactory: '%s' gave up loading %i:%i / %i:%i for a %s pickup",
+                tostring(self.shipName), s.x, s.y, t.x, t.y, tostring(haul.good)))
+
             self.data.probeRetries = 0
             self.data.currentHaul = nil
             self.data.phase = "idle"
@@ -769,6 +806,10 @@ function StockFactoryCommand:tryExecuteHaul()
     if not amount or amount <= 0 then
         -- source has no stock yet, or consumer is already full
         -- try a new random pair soon instead of cycling deterministically
+        print(string.format("StockFactory: '%s' skipped %s from '%s' to '%s' - target room %i, source stock %i, ship space %i",
+            tostring(self.shipName), tostring(good), tostring(haul.source.name), tostring(haul.target.name),
+            tr.targetRoom or 0, tr.sourceStock or 0, cargoUnits))
+
         self.data.currentHaul = nil
         self.data.transaction = nil
         self.data.phase = "idle"
@@ -1200,6 +1241,11 @@ function StockFactoryCommand:onAreaAnalysisFinished(results, meta)
     results.callingPlayer = meta.callingPlayer
 
     results.stations = gatherOwnedTradingStations(owner, reachable, meta.callingPlayer)
+
+    local numReachable = 0
+    for _ in pairs(reachable) do numReachable = numReachable + 1 end
+    print(string.format("StockFactory: analysis for '%s' anchored at %i:%i - %i reachable sectors, %i owned trading stations",
+        tostring(meta.shipName), ax, ay, numReachable, #results.stations))
 
     -- let the appearance system show the ferry anywhere in its operating region.
     -- each entry is flagged `hidden = true` so the vanilla map highlighter
