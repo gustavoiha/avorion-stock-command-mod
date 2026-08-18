@@ -216,6 +216,42 @@ for entry = 1, 65 do
 end
 check("an oversized failure table is discarded wholesale", overflowing:pruneHaulFailures() == nil)
 
+print("\n[delivery recovery]")
+
+local recoveryStations = {
+    {name = "Iron Mine", factionIndex = 10, x = 0, y = 0, sells = {Iron = "seller.lua"}, buys = {}},
+    {name = "Full Mill", factionIndex = 10, x = 1, y = 0, sells = {Steel = "factory.lua"}, buys = {Iron = "factory.lua"}},
+    {name = "Iron Foundry", factionIndex = 10, x = 2, y = 0, sells = {}, buys = {Iron = "factory.lua"}},
+    {name = "Steel Foundry", factionIndex = 10, x = 3, y = 0, sells = {}, buys = {Steel = "factory.lua"}},
+}
+
+local exchangeRecovery = Factory("Hauler", area, {ignoredGoods = {}})
+exchangeRecovery.data.stations = recoveryStations
+exchangeRecovery.data.currentHaul = {good = "Iron", source = recoveryStations[1], target = recoveryStations[2], carriedAmount = 10}
+local exchangeCandidates = exchangeRecovery:recoveryExchangeCandidates(exchangeRecovery.data.currentHaul)
+check("recovery finds a station good with a separate consumer",
+    #exchangeCandidates == 1 and exchangeCandidates[1].good == "Steel" and exchangeCandidates[1].target.name == "Steel Foundry")
+
+local fallbackRecovery = Factory("Hauler", area, {ignoredGoods = {}})
+fallbackRecovery.data.stations = {
+    recoveryStations[1],
+    {name = "Full Mill", factionIndex = 10, x = 1, y = 0, sells = {}, buys = {Iron = "factory.lua"}},
+    recoveryStations[3],
+}
+fallbackRecovery.data.currentHaul = {good = "Iron", source = fallbackRecovery.data.stations[1], target = fallbackRecovery.data.stations[2], carriedAmount = 10}
+fallbackRecovery:startDeliveryRecovery()
+check("recovery falls back to one alternative consumer when no exchange exists",
+    fallbackRecovery.data.currentHaul.recoveryUsed == true
+        and fallbackRecovery.data.phase == "haulingToTarget"
+        and fallbackRecovery.data.currentHaul.target.name == "Iron Foundry")
+
+local exhaustedRecovery = Factory("Hauler", area, {ignoredGoods = {}})
+exhaustedRecovery.data.commandToken = "current-command"
+exhaustedRecovery.data.currentHaul = {good = "Iron", source = recoveryStations[1], target = recoveryStations[3], carriedAmount = 10, recoveryUsed = true}
+exhaustedRecovery.data.transaction = {id = 9, stage = "delivering", good = "Iron"}
+exhaustedRecovery:onGoodsDelivered("current-command", 9, "Iron", 0, 10)
+check("a failed recovery delivery aborts without a second attempt", exhaustedRecovery.finishOnNextUpdate == true)
+
 print("\n[assignment]")
 local empty = Factory("Hauler", {lower = {x = 0, y = 0}, upper = {x = 0, y = 0}, analysis = {}}, {ignoredGoods = {}})
 check("a hauler can be assigned with no stations in range",

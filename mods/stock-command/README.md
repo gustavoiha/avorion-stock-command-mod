@@ -15,18 +15,29 @@ Stock Factory captain command mod for Avorion.
     privilege before alliance station cargo or stock-hauler settings can be
     changed.
 - Logs all cargo pickups and deliveries to the Economy chat channel for visibility.
-- Stores picked-up goods in the background ship's real cargo hold. If delivery
-    fails, the command aborts and returns the ship with its remaining cargo.
+- Stores picked-up goods in the background ship's real cargo hold. If a delivery
+    becomes full, the command makes one recovery attempt before returning the
+    ship with any remaining cargo.
 
 ## Cargo Overflow Handling
 
 Pickup and delivery are separate, correlated transactions. A pickup is only
 acknowledged after the goods have been written to the ship's database cargo.
-Delivery removes only the amount actually accepted by the destination.
+Delivery removes only the amount actually accepted by the destination. When cargo
+remains aboard because a destination filled up, the command makes one recovery
+attempt:
+
+- It first looks for a good sold by the full station that another reachable station
+    can accept in full. The replacement load must free enough station cargo space
+    for every remaining unit, and must fit entirely in the ship.
+- If an exchange is not viable, it tries one other reachable consumer for the
+    remaining original cargo.
+- A failed continuation delivery aborts the command. Successful exchanges are
+    logged as an Economy delivery followed by an Economy pickup.
 
 The command aborts and recalls the ship when:
 
-- A destination cannot accept all cargo.
+- A destination cannot accept all cargo and its one recovery attempt fails.
 - A source or destination disappears or becomes inaccessible.
 - A station-management permission is revoked while the route is active.
 - An asynchronous station transfer times out repeatedly.

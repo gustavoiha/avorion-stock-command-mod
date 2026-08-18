@@ -102,6 +102,50 @@ function StockFactoryUtility.transferToStation(cargoBay, shipEntry, tradingGood,
     return released, amount - released
 end
 
+-- Exchanges ship cargo for station cargo without requiring room for both goods aboard at
+-- once. A failed database write restores the station before reporting failure.
+function StockFactoryUtility.exchangeCargo(cargoBay, shipEntry, deliveredGood, deliveredAmount, pickedUpGood, pickedUpAmount)
+    local shipCargo = shipEntry:getCargo()
+    local shipDeliveredBefore = StockFactoryUtility.cargoAmount(shipCargo, deliveredGood)
+    local shipPickedUpBefore = StockFactoryUtility.cargoAmount(shipCargo, pickedUpGood)
+    if shipDeliveredBefore < deliveredAmount then return false end
+
+    local pickupBefore = cargoBay:getNumCargos(pickedUpGood)
+    cargoBay:removeCargo(pickedUpGood, pickedUpAmount)
+    local pickedUp = pickupBefore - cargoBay:getNumCargos(pickedUpGood)
+    if pickedUp ~= pickedUpAmount then
+        if pickedUp > 0 then cargoBay:addCargo(pickedUpGood, pickedUp) end
+        return false
+    end
+
+    local deliveryBefore = cargoBay:getNumCargos(deliveredGood)
+    cargoBay:addCargo(deliveredGood, deliveredAmount)
+    local delivered = cargoBay:getNumCargos(deliveredGood) - deliveryBefore
+    if delivered ~= deliveredAmount then
+        if delivered > 0 then cargoBay:removeCargo(deliveredGood, delivered) end
+        cargoBay:addCargo(pickedUpGood, pickedUp)
+        return false
+    end
+
+    StockFactoryUtility.removeCargo(shipCargo, deliveredGood, deliveredAmount)
+    StockFactoryUtility.addCargo(shipCargo, pickedUpGood, pickedUpAmount)
+    local ok = pcall(shipEntry.setCargo, shipEntry, shipCargo)
+    local shipDelivered = StockFactoryUtility.cargoAmount(shipEntry:getCargo(), deliveredGood)
+    local shipPickedUp = StockFactoryUtility.cargoAmount(shipEntry:getCargo(), pickedUpGood)
+
+    if ok
+        and shipDelivered == shipDeliveredBefore - deliveredAmount
+        and shipPickedUp == shipPickedUpBefore + pickedUpAmount then
+        return true
+    end
+
+    -- The ship did not accept the replacement state. Restore the station and leave the
+    -- command to abort rather than claim a swap that was not completed.
+    cargoBay:removeCargo(deliveredGood, deliveredAmount)
+    cargoBay:addCargo(pickedUpGood, pickedUpAmount)
+    return false
+end
+
 function StockFactoryUtility.isFactionBlockedByWar(owner, faction)
     return owner ~= nil
         and faction ~= nil

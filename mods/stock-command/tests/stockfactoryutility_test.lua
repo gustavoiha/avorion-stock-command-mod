@@ -170,6 +170,17 @@ local raisedDelivered, raisedRejected = Utility.transferToStation(raisingDeliver
 check("delivery reports nothing released when setCargo raises", raisedDelivered == 0 and raisedRejected == 30)
 check("delivery leaves the bay untouched when setCargo raises", (raisingDeliveryBay.stock.Iron or 0) == 0)
 
+local exchangeBay = makeBay({Steel = 15})
+local exchangeShip = makeShip({[iron] = 10})
+check("exchanges station cargo without temporary ship space", Utility.exchangeCargo(exchangeBay, exchangeShip, iron, 10, steel, 15))
+check("an exchange credits the delivered cargo to the station", exchangeBay.stock.Iron == 10 and exchangeBay.stock.Steel == 0)
+check("an exchange replaces the ship cargo", Utility.cargoAmount(exchangeShip:getCargo(), iron) == 0 and Utility.cargoAmount(exchangeShip:getCargo(), steel) == 15)
+
+local rejectedExchangeBay = makeBay({Steel = 15})
+local rejectedExchangeShip = makeShip({[iron] = 10}, function() end)
+check("a rejected exchange reports failure", not Utility.exchangeCargo(rejectedExchangeBay, rejectedExchangeShip, iron, 10, steel, 15))
+check("a rejected exchange restores station cargo", (rejectedExchangeBay.stock.Iron or 0) == 0 and rejectedExchangeBay.stock.Steel == 15)
+
 if failures > 0 then
     error(string.format("%d stock factory utility test(s) failed", failures))
 end
