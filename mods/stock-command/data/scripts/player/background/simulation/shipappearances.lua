@@ -1,6 +1,4 @@
--- Stock Factory mod — makes the ferry visible in loaded sectors (rule: the ship
--- must not disappear from view; it should be seen flying to a station, docking
--- and leaving again).
+-- Stock Factory mod — makes the ferry visible in loaded sectors.
 --
 -- This file name-clashes with the vanilla
 --   data/scripts/player/background/simulation/shipappearances.lua
@@ -9,50 +7,27 @@
 -- `CommandType` (with our extension applied), the `data` table and the
 -- `ShipAppearances` namespace are all in scope here.
 --
--- Vanilla places an appearance at a *random* reachable sector and then just lets
--- it patrol, so a stocking ferry was rarely seen where the player actually was
--- and never docked. We fix both below:
---   * findLocation is biased so the ferry shows up in the sector the watching
---     player is currently in (when that sector is on the ferry's route), or
---     otherwise at one of the route's stations — not somewhere random.
---   * the docking behaviour itself lives in the backgroundshipappearance.lua and
---     ai/stockfactoryferry.lua extensions.
+-- Vanilla places an appearance at a *random* reachable sector and then just lets it patrol,
+-- so a stocking ferry was rarely seen where the player actually was and never docked. The
+-- command decides where its ferry belongs on the current run (see
+-- StockFactoryCommand:getAppearanceSector); the docking behaviour itself lives in the
+-- backgroundshipappearance.lua and ai/stockfactoryferry.lua extensions.
 VisualizableCommands[CommandType.StockFactory] = true
-AppearanceChances[CommandType.StockFactory] = 0.5
+-- the command already returns nil for every tick the ferry should not be placed, so an
+-- extra dice roll would only randomly skip delivery approaches
+AppearanceChances[CommandType.StockFactory] = 1.0
 -- generous cap (minutes); the ferry AI normally jumps back out much sooner via
 -- ShipAppearances.returnFerryToBackground once it has finished a station visit
 AppearanceLengths[CommandType.StockFactory] = 6
 
 if onServer() then
 
--- The ferry AI only ever docks the station of the leg it is currently flying
--- (ai/stockfactoryferry.lua treats every other sector as a transit hop and leaves again
--- immediately), so the appearance has to be placed in exactly that sector. With no leg in
--- progress the ship is waiting for work, which it does at its anchor sector.
-local function stockFactoryDockSector(shipName)
+local function stockFactoryAppearanceSector(shipName)
     if not Simulation then return end
 
     for _, command in pairs(Simulation.commands) do
-        if command.shipName == shipName and command.data then
-            local haul = command.data.currentHaul
-
-            if not haul then
-                local anchor = command.data.anchor
-                if anchor and anchor.x and anchor.y then return anchor.x, anchor.y end
-                return
-            end
-
-            local phase = command.data.phase
-            local stop
-
-            if phase == "haulingToSource" or phase == "transactingPickup" then
-                stop = haul.source
-            elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
-                stop = haul.target
-            end
-
-            if stop and stop.x and stop.y then return stop.x, stop.y end
-            return
+        if command.shipName == shipName and command.getAppearanceSector then
+            return command:getAppearanceSector()
         end
     end
 end
@@ -63,7 +38,7 @@ end
 local stockFactoryOriginalFindLocation = ShipAppearances.findLocation
 function ShipAppearances.findLocation(shipName, commandType)
     if commandType == CommandType.StockFactory then
-        return stockFactoryDockSector(shipName)
+        return stockFactoryAppearanceSector(shipName)
     end
 
     return stockFactoryOriginalFindLocation(shipName, commandType)

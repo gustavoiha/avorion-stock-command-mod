@@ -18,13 +18,14 @@ meta =
     description = "Adds a new captain command, \"Stock Factory\". Assign a ship "
         .. "(with a captain and a cargo hold) to stock your stations across a gate "
         .. "network. The ship ferries selected goods between authorized player and "
-        .. "alliance stations and keeps undelivered cargo in its real hold.",
+        .. "alliance stations, moving each load in one transfer so nothing is ever "
+        .. "left stranded in its hold.",
 
     -- Authors.
     authors = {"Gugs_Iha"},
 
     -- Version (major.minor[.patch]).
-    version = "1.4",
+    version = "1.5",
 
     -- Dependencies. Left empty on purpose so the mod isn't tied to a specific
     -- Avorion patch version.

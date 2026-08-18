@@ -48,11 +48,29 @@ function valid(value) return value ~= nil end
 function eprint() end
 
 local randomPicksHigh = false
+local randomTestResult = false
 function random()
-    return {getInt = function(_, low, high) return randomPicksHigh and high or low end}
+    return {
+        getInt = function(_, low, high) return randomPicksHigh and high or low end,
+        test = function() return randomTestResult end,
+    }
 end
 
-ChatMessageType = {Error = 1, Normal = 2}
+ChatMessageType = {Error = 1, Normal = 2, Economy = 3, Information = 4}
+
+-- captures every sector job the command dispatches, so the tests can assert which sector
+-- was addressed without running any of the embedded code
+local sectorCalls = {}
+function runSectorCode(x, y)
+    table.insert(sectorCalls, {x = x, y = y})
+end
+
+function Galaxy()
+    return {
+        keepOrGetSector = function() return true end,
+        sectorLoaded = function() return true end,
+    }
+end
 
 local shipScriptValues = {}
 function ShipDatabaseEntry()
@@ -60,6 +78,7 @@ function ShipDatabaseEntry()
         getFreeCargoSpace = function() return 100 end,
         getScriptValue = function(_, key) return shipScriptValues[key] end,
         setScriptValue = function(_, key, value) shipScriptValues[key] = value end,
+        addScriptOnce = function() end,
     }
 end
 function getParentFaction() return {index = 10, sendChatMessage = function() end} end
@@ -106,18 +125,26 @@ check("pickup opt-out affects prediction", command:calculatePrediction(10, "Haul
 
 print("\n[haul planning]")
 
+-- producer and consumer sit in different sectors so the appearance/route tests can tell
+-- the two ends of a run apart
 local function pairedStations()
     return {
         {name = "Iron Mine", factionIndex = 10, x = 0, y = 0, sells = {Iron = "seller.lua"}, buys = {}},
-        {name = "Steel Mill", factionIndex = 10, x = 0, y = 0, sells = {Steel = "factory.lua"}, buys = {Iron = "factory.lua"}},
+        {name = "Steel Mill", factionIndex = 10, x = 1, y = 0, sells = {Steel = "factory.lua"}, buys = {Iron = "factory.lua"}},
     }
 end
 
-local planner = Factory("Hauler", area, {ignoredGoods = {}})
-planner.data.stations = pairedStations()
+local function freshPlanner()
+    local instance = Factory("Hauler", area, {ignoredGoods = {}})
+    instance.data.stations = pairedStations()
+    instance.data.commandToken = "current-command"
+    return instance
+end
+
+local planner = freshPlanner()
 planner:planNextHaul()
 check("planning picks the producer/consumer pair",
-    planner.data.phase == "haulingToSource"
+    planner.data.phase == "travelling"
         and planner.data.currentHaul.good == "Iron"
         and planner.data.currentHaul.source.name == "Iron Mine"
         and planner.data.currentHaul.target.name == "Steel Mill")
@@ -125,16 +152,13 @@ check("planning resolves the trade script for both ends",
     planner.data.currentHaul.source.script == "seller.lua"
         and planner.data.currentHaul.target.script == "factory.lua")
 
-check("a haul leg is at least 2 minutes", planner.data.currentHaul.travelTime == 2 * 60)
-check("every leg of a haul uses the same travel time",
-    planner.data.currentHaul.pickupTravelTime == planner.data.currentHaul.travelTime
-        and planner.data.currentHaul.deliveryTravelTime == planner.data.currentHaul.travelTime)
+check("a run is at least 4 minutes", planner.data.currentHaul.travelTime == 4 * 60)
+check("a run never parks cargo on the ship", planner.data.currentHaul.carriedAmount == nil)
 
 randomPicksHigh = true
-local slowPlanner = Factory("Hauler", area, {ignoredGoods = {}})
-slowPlanner.data.stations = pairedStations()
+local slowPlanner = freshPlanner()
 slowPlanner:planNextHaul()
-check("a haul leg is at most 3 minutes", slowPlanner.data.currentHaul.travelTime == 3 * 60)
+check("a run is at most 6 minutes", slowPlanner.data.currentHaul.travelTime == 6 * 60)
 randomPicksHigh = false
 
 local ignoring = Factory("Hauler", area, {ignoredGoods = {Iron = true}})
@@ -153,12 +177,6 @@ check("a hauling ship reports that it is stocking",
     planner:getStatusMessage() == "Stocking a sector /* ship AI status */")
 
 print("\n[recent failure memory]")
-
-local function freshPlanner()
-    local instance = Factory("Hauler", area, {ignoredGoods = {}})
-    instance.data.stations = pairedStations()
-    return instance
-end
 
 local emptySource = freshPlanner()
 emptySource.data.currentHaul = {good = "Iron", source = emptySource.data.stations[1], target = emptySource.data.stations[2]}
@@ -180,7 +198,6 @@ check("a remembered full target is not picked again",
 check("a blocked plan retries sooner than a dry galaxy", fullTarget.data.rescanCooldown == 60)
 
 local pickupFailure = freshPlanner()
-pickupFailure.data.commandToken = "current-command"
 pickupFailure.data.currentHaul = {good = "Iron", source = pickupFailure.data.stations[1], target = pickupFailure.data.stations[2]}
 pickupFailure.data.transaction = {id = 7, stage = "removing", good = "Iron"}
 pickupFailure:onGoodsRemoved("current-command", 7, "Iron", 0)
@@ -192,20 +209,19 @@ expiring.data.clock = 10 * 60
 check("a failure expires and is forgotten", expiring:pruneHaulFailures() == nil)
 expiring:planNextHaul()
 check("an expired failure no longer blocks the pair",
-    expiring.data.phase == "haulingToSource" and expiring.data.currentHaul.good == "Iron")
+    expiring.data.phase == "travelling" and expiring.data.currentHaul.good == "Iron")
 
 -- delivering inputs to a station can restart its production, so it stops counting as dry
 local restocked = freshPlanner()
-restocked.data.commandToken = "current-command"
 restocked:noteHaulFailure("source", "Iron", restocked.data.stations[1])
 restocked:noteHaulFailure("target", "Steel", restocked.data.stations[1])
-restocked.data.currentHaul = {good = "Steel", source = restocked.data.stations[2], target = restocked.data.stations[1], carriedAmount = 10}
+restocked.data.currentHaul = {good = "Steel", source = restocked.data.stations[2], target = restocked.data.stations[1]}
 restocked.data.transaction = {id = 3, stage = "delivering", good = "Steel"}
 restocked:onGoodsDelivered("current-command", 3, "Steel", 10, 0)
 check("delivering to a station leaves its other blocks alone", tablelength(restocked.data.recentFailures) == 1)
 restocked:planNextHaul()
 check("delivering to a station clears its dry-source block",
-    restocked.data.phase == "haulingToSource"
+    restocked.data.phase == "travelling"
         and restocked.data.currentHaul.good == "Iron"
         and restocked.data.currentHaul.source.name == "Iron Mine")
 
@@ -216,41 +232,127 @@ for entry = 1, 65 do
 end
 check("an oversized failure table is discarded wholesale", overflowing:pruneHaulFailures() == nil)
 
-print("\n[delivery recovery]")
+print("\n[transfer]")
 
-local recoveryStations = {
-    {name = "Iron Mine", factionIndex = 10, x = 0, y = 0, sells = {Iron = "seller.lua"}, buys = {}},
-    {name = "Full Mill", factionIndex = 10, x = 1, y = 0, sells = {Steel = "factory.lua"}, buys = {Iron = "factory.lua"}},
-    {name = "Iron Foundry", factionIndex = 10, x = 2, y = 0, sells = {}, buys = {Iron = "factory.lua"}},
-    {name = "Steel Foundry", factionIndex = 10, x = 3, y = 0, sells = {}, buys = {Steel = "factory.lua"}},
-}
+local moving = freshPlanner()
+moving.data.currentHaul = {good = "Iron", source = moving.data.stations[1], target = moving.data.stations[2]}
+moving.data.transaction = {id = 11, stage = "removing", good = "Iron"}
+sectorCalls = {}
+moving:onGoodsRemoved("current-command", 11, "Iron", 40)
+check("a completed pickup immediately dispatches the delivery",
+    moving.data.transaction.stage == "delivering" and moving.data.transaction.amount == 40)
+check("the delivery is dispatched to the consumer's sector",
+    #sectorCalls == 1 and sectorCalls[1].x == 1 and sectorCalls[1].y == 0)
 
-local exchangeRecovery = Factory("Hauler", area, {ignoredGoods = {}})
-exchangeRecovery.data.stations = recoveryStations
-exchangeRecovery.data.currentHaul = {good = "Iron", source = recoveryStations[1], target = recoveryStations[2], carriedAmount = 10}
-local exchangeCandidates = exchangeRecovery:recoveryExchangeCandidates(exchangeRecovery.data.currentHaul)
-check("recovery finds a station good with a separate consumer",
-    #exchangeCandidates == 1 and exchangeCandidates[1].good == "Steel" and exchangeCandidates[1].target.name == "Steel Foundry")
+local delivering = freshPlanner()
+delivering.data.currentHaul = {good = "Iron", source = delivering.data.stations[1], target = delivering.data.stations[2]}
+delivering.data.transaction = {id = 12, stage = "delivering", good = "Iron", amount = 40}
+sectorCalls = {}
+delivering:onGoodsDelivered("current-command", 12, "Iron", 40, 0)
+check("a delivered run goes straight to the next job",
+    delivering.data.phase == "idle"
+        and delivering.data.currentHaul == nil
+        and delivering.data.transaction == nil
+        and delivering.data.rescanCooldown == 0)
+check("a full delivery needs no return trip", #sectorCalls == 0)
 
-local fallbackRecovery = Factory("Hauler", area, {ignoredGoods = {}})
-fallbackRecovery.data.stations = {
-    recoveryStations[1],
-    {name = "Full Mill", factionIndex = 10, x = 1, y = 0, sells = {}, buys = {Iron = "factory.lua"}},
-    recoveryStations[3],
-}
-fallbackRecovery.data.currentHaul = {good = "Iron", source = fallbackRecovery.data.stations[1], target = fallbackRecovery.data.stations[2], carriedAmount = 10}
-fallbackRecovery:startDeliveryRecovery()
-check("recovery falls back to one alternative consumer when no exchange exists",
-    fallbackRecovery.data.currentHaul.recoveryUsed == true
-        and fallbackRecovery.data.phase == "haulingToTarget"
-        and fallbackRecovery.data.currentHaul.target.name == "Iron Foundry")
+local overdelivered = freshPlanner()
+overdelivered.data.currentHaul = {good = "Iron", source = overdelivered.data.stations[1], target = overdelivered.data.stations[2]}
+overdelivered.data.transaction = {id = 13, stage = "delivering", good = "Iron", amount = 40}
+sectorCalls = {}
+overdelivered:onGoodsDelivered("current-command", 13, "Iron", 25, 15)
+check("goods the consumer could not take go back to the producer",
+    #sectorCalls == 1 and sectorCalls[1].x == 0 and sectorCalls[1].y == 0)
+check("a consumer that filled up is remembered", tablelength(overdelivered.data.recentFailures) == 1)
+check("an overdelivery still finishes the run", overdelivered.data.phase == "idle")
 
-local exhaustedRecovery = Factory("Hauler", area, {ignoredGoods = {}})
-exhaustedRecovery.data.commandToken = "current-command"
-exhaustedRecovery.data.currentHaul = {good = "Iron", source = recoveryStations[1], target = recoveryStations[3], carriedAmount = 10, recoveryUsed = true}
-exhaustedRecovery.data.transaction = {id = 9, stage = "delivering", good = "Iron"}
-exhaustedRecovery:onGoodsDelivered("current-command", 9, "Iron", 0, 10)
-check("a failed recovery delivery aborts without a second attempt", exhaustedRecovery.finishOnNextUpdate == true)
+print("\n[ferry visuals]")
+
+local function travellingCommand(timer, visitSource)
+    local instance = freshPlanner()
+    local stations = instance.data.stations
+    instance.data.anchor = {x = 5, y = 5}
+    instance.data.currentHaul = {
+        good = "Iron",
+        source = {name = stations[1].name, factionIndex = 10, x = 0, y = 0, script = "seller.lua"},
+        target = {name = stations[2].name, factionIndex = 10, x = 1, y = 0, script = "factory.lua"},
+        travelTime = 240,
+        visitSource = visitSource and true or false,
+    }
+    instance.data.phase = "travelling"
+    instance.data.timer = timer
+    -- keep update() away from the route re-scan, which needs the whole galaxy stubbed
+    instance.data.remapCooldown = math.huge
+    return instance
+end
+
+local idleFerry = freshPlanner()
+idleFerry.data.anchor = {x = 5, y = 5}
+idleFerry.data.phase = "idle"
+local idleX, idleY = idleFerry:getAppearanceSector()
+check("an idle ferry waits at the anchor", idleX == 5 and idleY == 5)
+check("an idle ferry has nothing to dock", idleFerry:getFerryDockTarget() == nil)
+
+local earlyVisit = travellingCommand(0, true)
+local visitX, visitY = earlyVisit:getAppearanceSector()
+check("a run that rolled a producer visit shows the ferry there", visitX == 0 and visitY == 0)
+check("the producer visit offers the producer as a decorative dock",
+    earlyVisit:getFerryDockTarget().name == "Iron Mine")
+check("the ferry may patrol while the run still has slack",
+    earlyVisit:ferryTransitLinger() == 60)
+
+local approaching = travellingCommand(200, true)
+local approachX, approachY = approaching:getAppearanceSector()
+check("the approach window moves the ferry to the consumer", approachX == 1 and approachY == 0)
+check("the approach window docks the consumer",
+    approaching:getFerryDockTarget().name == "Steel Mill")
+check("there is no patrol time left during the approach", approaching:ferryTransitLinger() == 0)
+
+local docking = travellingCommand(200, false)
+sectorCalls = {}
+docking:onFerryDocked(1, 0, "Steel Mill")
+check("docking the consumer starts the transfer", docking.data.phase == "transferring")
+check("docking the consumer probes both stations", #sectorCalls == 2)
+
+local wrongDock = travellingCommand(200, false)
+wrongDock:onFerryDocked(0, 0, "Iron Mine")
+check("docking the producer does not start the transfer", wrongDock.data.phase == "travelling")
+
+local earlyDock = travellingCommand(10, false)
+earlyDock:onFerryDocked(1, 0, "Steel Mill")
+check("docking before the approach window does not start the transfer",
+    earlyDock.data.phase == "travelling")
+
+print("\n[transfer timing]")
+
+local unwatched = travellingCommand(240, false)
+unwatched:update(60)
+check("an unwatched run transfers as soon as the timer expires",
+    unwatched.data.phase == "transferring")
+
+local watched = travellingCommand(240, false)
+watched.data.clock = 240
+watched.data.ferrySector = {x = 1, y = 0, clock = 240}
+watched:update(60)
+check("a watched run waits for the ferry to dock", watched.data.phase == "travelling")
+
+local watchedTooLong = travellingCommand(240 + 90, false)
+watchedTooLong.data.clock = 330
+watchedTooLong.data.ferrySector = {x = 1, y = 0, clock = 330}
+watchedTooLong:update(60)
+check("waiting for a dock gives up after the grace period",
+    watchedTooLong.data.phase == "transferring")
+
+local stalled = travellingCommand(0, false)
+stalled.data.phase = "transferring"
+stalled.data.transaction = {id = 20, stage = "removing", good = "Iron"}
+stalled.data.timer = 0
+stalled:update(400)
+check("a stalled transfer is abandoned rather than recalled",
+    stalled.data.phase == "idle"
+        and stalled.data.currentHaul == nil
+        and stalled.data.transaction == nil
+        and not stalled.finishOnNextUpdate)
 
 print("\n[assignment]")
 local empty = Factory("Hauler", {lower = {x = 0, y = 0}, upper = {x = 0, y = 0}, analysis = {}}, {ignoredGoods = {}})
@@ -260,7 +362,7 @@ check("a hauler can be assigned when nothing pairs up",
     producerOnly:getErrors(10, "Hauler", area, producerOnly.config) == nil)
 
 print("\n[callback correlation]")
-command.data.phase = "transactingPickup"
+command.data.phase = "transferring"
 command.data.currentHaul = {good = "Iron", source = command.data.stations[1], target = command.data.stations[2]}
 command.data.transaction = {id = 42, stage = "probing", good = "Iron", targetReceived = false, sourceReceived = false}
 command:reportTargetStock("current-command", 41, "Iron", 0, 100)
@@ -274,77 +376,27 @@ command.data.transaction = {id = 42, stage = "removing", good = "Iron"}
 command:reportTargetStock("current-command", 42, "Iron", 0, 100)
 check("wrong-stage callback is ignored", command.data.transaction.stage == "removing")
 
-print("\n[stalled transactions]")
-
-local haul = {good = "Iron", source = command.data.stations[1], target = command.data.stations[2]}
-
-command.data.phase = "transactingPickup"
-command.data.currentHaul = haul
-command.data.transaction = {id = 43, stage = "removing", good = "Iron"}
-command.data.timer = 250
-command:rewindPendingTransaction()
-check("rewinding a pickup returns to the source leg", command.data.phase == "haulingToSource")
-check("rewinding clears the pending transaction", command.data.transaction == nil)
-check("rewinding restarts the phase timer", command.data.timer == 0)
-
-command.data.phase = "transactingDelivery"
-command.data.transaction = {id = 44, stage = "delivering", good = "Iron"}
-command:rewindPendingTransaction()
-check("rewinding a delivery returns to the target leg", command.data.phase == "haulingToTarget")
-
-command.data.phase = "transactingPickup"
-command.data.currentHaul = nil
-command.data.transaction = {id = 45, stage = "removing", good = "Iron"}
-command:rewindPendingTransaction()
-check("rewinding without a haul falls back to idle", command.data.phase == "idle")
-
-command.data.transaction = nil
-command.data.phase = "haulingToSource"
-command:rewindPendingTransaction()
-check("rewinding without a transaction changes nothing", command.data.phase == "haulingToSource")
-
--- a stalled sector reply must retry the leg a few times before it is allowed to recall
-command.finishOnNextUpdate = nil
-command.data.currentHaul = haul
-command.data.transactionTimeouts = 0
-for attempt = 1, 2 do
-    command.data.phase = "transactingPickup"
-    command.data.transaction = {id = 50 + attempt, stage = "removing", good = "Iron"}
-    command.data.timer = 0
-    command:update(400)
-    check("timeout " .. attempt .. " retries instead of recalling",
-        command.data.phase == "haulingToSource" and not command.finishOnNextUpdate)
-end
-
-command.data.phase = "transactingPickup"
-command.data.transaction = {id = 60, stage = "removing", good = "Iron"}
-command.data.timer = 0
-command:update(400)
-check("the retry budget eventually gives up and recalls", command.finishOnNextUpdate == true)
-
--- a completed transfer clears the budget so unrelated later stalls get their full retries
-command.data.transaction = {id = 61, stage = "delivering", good = "Iron"}
-command.data.currentHaul = haul
-haul.carriedAmount = 10
-command:onGoodsDelivered("current-command", 61, "Iron", 10, 0)
-check("a successful delivery resets the timeout budget", command.data.transactionTimeouts == 0)
-check("a delivered haul goes straight to the next job with no trip home",
-    command.data.phase == "idle"
-        and command.data.currentHaul == nil
-        and command.data.rescanCooldown == 0)
-
 print("\n[restore]")
 
--- a restored v2 command must not sit waiting for a sector reply that died with the server
+-- a restored command must not sit waiting for a sector reply that died with the server
 local restored = Factory("Hauler", area, {ignoredGoods = {}})
-restored.data.transactionProtocolVersion = 2
+restored.data.transferProtocolVersion = 3
 restored.data.commandToken = "restored-command"
-restored.data.phase = "transactingDelivery"
-restored.data.currentHaul = haul
+restored.data.phase = "transferring"
+restored.data.currentHaul = {good = "Iron", source = command.data.stations[1], target = command.data.stations[2]}
 restored.data.transaction = {id = 70, stage = "delivering", good = "Iron"}
 restored:onRestore(restored.data)
 check("restore drops the orphaned transaction", restored.data.transaction == nil)
-check("restore replays the interrupted leg", restored.data.phase == "haulingToTarget")
+check("restore looks for a new run instead of replaying", restored.data.phase == "idle")
+check("restore does not recall a healthy command", not restored.finishOnNextUpdate)
+
+-- goods used to sit on the ship between two stations; such a command can't be reconciled
+local legacy = Factory("Hauler", area, {ignoredGoods = {}})
+legacy.data.commandToken = "legacy-command"
+legacy.data.currentHaul = {good = "Iron", source = command.data.stations[1], target = command.data.stations[2], carriedAmount = 20}
+legacy:onRestore(legacy.data)
+check("a command from before instant transfers is recalled for cargo verification",
+    legacy.finishOnNextUpdate == true)
 
 if failures > 0 then
     error(string.format("%d stock factory command test(s) failed", failures))

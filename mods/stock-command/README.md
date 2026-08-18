@@ -14,47 +14,55 @@ Stock Factory captain command mod for Avorion.
 - Requires the initiating player to have the alliance `Manage Stations`
     privilege before alliance station cargo or stock-hauler settings can be
     changed.
-- Logs all cargo pickups and deliveries to the Economy chat channel for visibility.
-- Stores picked-up goods in the background ship's real cargo hold. If a delivery
-    becomes full, the command makes one recovery attempt before returning the
-    ship with any remaining cargo.
+- Logs every completed transfer to the Economy chat channel, e.g.
+    `(2:2) Hauler transferred 100 units of Aluminium from Aluminium Mine to Steel Factory.`
+- Goods are never parked on the ship. Each run ends in a single transfer that takes
+    them out of the producer's cargo bay and puts them into the consumer's while both
+    sectors are held in memory, the way vanilla's Supply command works.
 
-## Cargo Overflow Handling
+## Transfers
 
-Pickup and delivery are separate, correlated transactions. A pickup is only
-acknowledged after the goods have been written to the ship's database cargo.
-Delivery removes only the amount actually accepted by the destination. When cargo
-remains aboard because a destination filled up, the command makes one recovery
-attempt:
+A run is one travel leg. When it ends, the command probes both stations, moves the
+goods out of the producer, and pushes them into the consumer within the same few
+frames. The amount is clamped to the consumer's free room, the producer's stock and
+the hauler's cargo capacity.
 
-- It first looks for a good sold by the full station that another reachable station
-    can accept in full. The replacement load must free enough station cargo space
-    for every remaining unit, and must fit entirely in the ship.
-- If an exchange is not viable, it tries one other reachable consumer for the
-    remaining original cargo.
-- A failed continuation delivery aborts the command. Successful exchanges are
-    logged as an Economy delivery followed by an Economy pickup.
+Because the whole exchange resolves in one burst, a consumer can only fill up in the
+few frames between the probe and the transfer, and only if another hauler is working
+the same route. Whatever the consumer could not take is pushed straight back into the
+producer's bay, so nothing is destroyed and the ship is never left holding cargo.
+
+A run that finds an empty producer or a full consumer is simply abandoned; the
+station is remembered for a while so the next plan skips it, and the ship picks
+another route.
 
 The command aborts and recalls the ship when:
 
-- A destination cannot accept all cargo and its one recovery attempt fails.
 - A source or destination disappears or becomes inaccessible.
 - A station-management permission is revoked while the route is active.
-- An asynchronous station transfer times out repeatedly.
-- A five-minute route remap finds no consumer or eligible supplier.
 
-Any undelivered goods remain in the ship's cargo hold for the player to handle.
+A stalled station transfer is abandoned rather than retried, and the ship looks for
+another route. Nothing is in transit between two stations for longer than a few
+frames, so an abandoned transfer strands nothing. A transfer interrupted by a server
+restart is dropped on load for the same reason.
 
 An empty producer is not a failure: the command simply waits and tries another
-eligible route. A producer that is *destroyed*, sold, or opted out is different —
-it disappears from the route map, so if it was the last one the next five-minute
-remap recalls the ship rather than leaving it idle forever.
+eligible route. Commands saved before this transfer model are recalled once on load
+so any cargo still in the hold can be verified by hand.
 
-A stalled station transfer is retried rather than aborted. Because the ship's real
-cargo is the source of truth and every transfer clamps to it, replaying a leg cannot
-duplicate goods; only repeated timeouts recall the ship. For the same reason, a
-transfer interrupted by a server restart is replayed on load instead of stranding
-the command.
+## Ferry visuals
+
+When a player is in one of the ferry's sectors, the background ship appears and flies
+for real. It has three states:
+
+- **Waiting** — with no run in progress it patrols its anchor sector.
+- **Travelling** — during the first part of a run it patrols and passes through the
+    sectors on its gate route, entering and leaving through the actual gates. Some
+    runs include a decorative stop at the producer.
+- **Delivering** — for the tail of the run it is parked in the consumer's sector, so a
+    watching player sees it fly in and dock. Docking is what triggers the transfer, so
+    the Economy message lands exactly as the ship touches the dock. If nobody is
+    watching, or it cannot reach a dock, the transfer fires on the timer instead.
 
 ## Folder contents
 

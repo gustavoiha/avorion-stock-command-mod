@@ -13,14 +13,17 @@ local Placer = include ("placer")
 -- sectors the ferry operates in. It makes the ferry behave like an NPC trader:
 --
 --   * arrive through a gate (if the sector has one) instead of just popping in,
---   * fly to one of the owner's stations and dock,
+--   * fly to the station the command named for this leg and dock,
 --   * wait a short moment,
 --   * fly back out through a gate (if available) and leave.
 --
+-- In a sector with nothing to dock it patrols for as long as the command's run has slack,
+-- then leaves through the gate that points at its next stop.
+--
 -- If the sector has no gate the ferry falls back to jumping in / out on the spot.
--- It is purely visual: the goods themselves are still moved by the background
--- command (stockfactorycommand.lua). When no player is watching the sector, this
--- script is never attached and the command stays a pure background behaviour.
+-- Docking the delivery station is reported back to the command, which is what makes the
+-- goods transfer resolve exactly as the ferry touches the dock. Everything else here is
+-- purely visual: the goods themselves are moved by the background command.
 --
 -- Modeled on the vanilla data/scripts/entity/ai/trade.lua (dock behaviour) and
 -- data/scripts/entity/ai/passgate.lua (gate approach).
@@ -51,6 +54,9 @@ local nextHopReady = false
 local nextHopUseGate = false
 local dockTarget
 local loiterHere = false
+local transitLinger = 0
+local transitCount = 0
+local transitDestination
 
 -- arrival bookkeeping: we hold at the spawn point until the command answers with our
 -- route, so a slow reply is never mistaken for "nothing to dock at here"
@@ -158,10 +164,11 @@ function initialize(faction)
 end
 
 -- called by the command (through the sector) with the next hop of our route
-function setNextHop(nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
+function setNextHop(nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter, linger)
     nextHop = {x = nextX, y = nextY}
     nextHopUseGate = useGate and true or false
     loiterHere = loiter and true or false
+    transitLinger = tonumber(linger) or 0
 
     if hasDockTarget and dockName and dockName ~= "" then
         dockTarget = {
@@ -187,6 +194,8 @@ function secure()
         nextHopUseGate = nextHopUseGate,
         dockTarget = dockTarget,
         loiterHere = loiterHere,
+        transitLinger = transitLinger,
+        transitCount = transitCount,
     }
 end
 
@@ -200,6 +209,8 @@ function restore(values)
     nextHopUseGate = values.nextHopUseGate and true or false
     dockTarget = values.dockTarget
     loiterHere = values.loiterHere and true or false
+    transitLinger = values.transitLinger or 0
+    transitCount = values.transitCount or 0
 end
 
 -- exact station for the current pickup/delivery leg, supplied by the command
@@ -228,6 +239,27 @@ local function requestReturn(ship)
             "background/simulation/shipappearances.lua",
             "returnFerryToBackground", ship.name)
     end)
+end
+
+-- tell the command we are docked; when this is the delivery stop it is what triggers the
+-- goods transfer, so the economy message lands together with the visible docking
+local function reportDocked(station)
+    local x, y = Sector():getCoordinates()
+
+    pcall(function()
+        invokeFactionFunction(factionIndex, true,
+            "background/simulation/simulation.lua",
+            "invokeCommandFunction", Entity().name, "onFerryDocked", x, y, station.name)
+    end)
+end
+
+-- lazy wander used while the ferry has time to spare in a sector it isn't docking at
+local function patrolTransit(ship)
+    if not transitDestination or distance(ship.translationf, transitDestination) < 500 then
+        transitDestination = random():getDirection() * random():getFloat(2000, 8000)
+    end
+
+    ShipAI():setFly(transitDestination, 0)
 end
 
 -- fly to the chosen exit gate and, once we reach it, jump out there; if there is
@@ -321,11 +353,19 @@ function updateServer(timeStep)
 
     stage = stage or 0
 
-    -- leaving / done stages don't need the station any more
+    -- leaving / patrolling / done stages don't need the station any more
     if stage == 3 then
         leaveThroughGate(ship)
         return
     elseif stage == 4 then
+        return
+    elseif stage == 5 then
+        transitCount = transitCount + timeStep
+        if transitCount >= transitLinger then
+            stage = 3
+        else
+            patrolTransit(ship)
+        end
         return
     end
 
@@ -336,11 +376,12 @@ function updateServer(timeStep)
     if not valid(station) then
         station = findDockTargetStation()
         if not valid(station) then
-            -- this sector is just a transit hop for the current leg
+            -- nothing to dock at here: drift for as long as the run has slack, then leave
             local gate, isJump = chosenGate(ship)
             exitGateId = (gate and not isJump) and gate.id or nil
             DockAI.reset()
-            stage = 3
+            transitCount = 0
+            stage = (transitLinger > 0) and 5 or 3
             return
         end
         stationId = station.id
@@ -353,6 +394,7 @@ function updateServer(timeStep)
         if DockAI.flyToDock(ship, station) then
             stage = 1
             waitCount = 0
+            reportDocked(station)
         end
 
     elseif stage == 1 then

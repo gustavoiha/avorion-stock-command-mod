@@ -19,11 +19,27 @@ StockFactoryCommand.type = CommandType.StockFactory
 -- anchor-sector operating radius over the gate network
 local MaxGateJumps = 5
 
--- How long one leg of a haul takes. Flat rather than distance-based, so a haul is a
--- predictable few minutes of work wherever the stations are. Whole minutes only: the
--- background simulation ticks once a minute, so anything else just rounds up to one.
-local MinTravelMinutes = 2
-local MaxTravelMinutes = 3
+-- How long a run takes. Flat rather than distance-based, so a run is a predictable few
+-- minutes of work wherever the stations are. Whole minutes only: the background simulation
+-- ticks once a minute, so anything else just rounds up to one. A run is a single leg now
+-- (the whole transfer resolves at the end of it), so this covers what used to be two.
+local MinTravelMinutes = 4
+local MaxTravelMinutes = 6
+
+-- Tail of a run during which the ferry appearance is placed at the delivery target, so a
+-- watching player sees it fly in and dock before the transfer resolves.
+local ApproachSeconds = 120
+
+-- How long past the scheduled transfer time the command waits for a watched ferry to finish
+-- docking. Nothing is in flight between stations, so overshooting only costs a little time.
+local DockGraceSeconds = 90
+
+-- Upper bound on how long the ferry patrols a transit sector before moving on. It has to
+-- vacate the single appearance slot in time for the delivery approach.
+local MaxTransitLinger = 60
+
+-- Chance that a run includes a purely decorative stop at the source station.
+local SourceVisitChance = 0.35
 
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
@@ -33,10 +49,9 @@ local RemapInterval = 5 * 60
 local CommandLeaseKey = "stock_factory_command_lease"
 local probeCode
 
--- how long to wait for an asynchronous sector transfer before replaying the leg,
--- and how many replays to allow before giving up and recalling
+-- How long to wait for an asynchronous sector transfer before giving up on the run. Goods
+-- only ever live in a station's cargo bay, so an abandoned transfer strands nothing.
 local TransactionTimeout = 300
-local MaxTransactionTimeouts = 2
 
 -- Sector loading is asynchronous and querySectors polls once per command update, i.e. once
 -- per background-simulation tick (Simulation.getUpdateInterval() == 60). This MUST stay
@@ -230,7 +245,7 @@ function StockFactoryCommand:onStart()
     self.data.remapCooldown = RemapInterval
     self.data.nextTransactionId = 0
     self.data.transaction = nil
-    self.data.transactionProtocolVersion = 2
+    self.data.transferProtocolVersion = 3
     self.data.commandToken = tostring(random():createSeed()) .. ":" .. tostring(random():createSeed())
 
     local owner = getParentFaction()
@@ -301,85 +316,54 @@ function StockFactoryCommand:update(timeStep)
         end
         self:planNextHaul()
 
-    elseif phase == "haulingToSource" then
+    elseif phase == "travelling" then
         local haul = self.data.currentHaul
         if not haul then
             self.data.phase = "idle"
             return
         end
 
-        local legTime = haul.pickupTravelTime or haul.travelTime or 60
-        if self.data.timer >= legTime then
-            self:beginPickupTransaction()
+        local legTime = haul.travelTime or 60
+
+        if self.data.timer >= legTime + DockGraceSeconds then
+            -- the ferry never reported a dock (nobody watching, docks full, player left)
+            self:beginTransfer()
+        elseif self.data.timer >= legTime then
+            if self:ferryIsApproachingTarget() then
+                -- hold the transfer so the message lands as the ferry touches the dock
+                self:querySectors(true, true)
+            else
+                self:beginTransfer()
+            end
         elseif self.data.timer + timeStep >= legTime then
             -- sector loading is async, so start it a tick early and arrive to a ready sector
             self:querySectors(true, true)
         end
 
-    elseif phase == "haulingToTarget" then
-        local haul = self.data.currentHaul
-        if not haul then
-            self.data.phase = "idle"
-            return
-        end
-
-        local legTime = haul.deliveryTravelTime or haul.travelTime or 60
-        if self.data.timer >= legTime then
-            self:beginDeliveryTransaction()
-        elseif self.data.timer + timeStep >= legTime then
-            self:querySectors(false, true)
-        end
-
-    elseif phase == "recovering" then
-        self:beginRecoveryProbe()
-
-    elseif phase == "transactingPickup" or phase == "transactingDelivery" or phase == "transactingRecovery" then
-        -- waiting for the asynchronous sector probes / transfers to report back.
-        -- The ship's real cargo is the source of truth and every transfer clamps to it,
-        -- so replaying the leg can't duplicate goods. Only give up after repeated timeouts.
+    elseif phase == "transferring" then
+        -- waiting for the asynchronous sector probes / transfers to report back. Goods only
+        -- ever exist inside a station's cargo bay, so abandoning the run strands nothing.
         if self.data.timer >= TransactionTimeout then
-            self.data.transactionTimeouts = (self.data.transactionTimeouts or 0) + 1
-
             local tr = self.data.transaction or {}
-            print(string.format("StockFactory: '%s' transfer timeout %i in %s - transaction #%s stage '%s', good '%s', target reply %s, source reply %s",
-                tostring(self.shipName), self.data.transactionTimeouts, phase,
-                tostring(tr.id), tostring(tr.stage), tostring(tr.good),
+            print(string.format("StockFactory: '%s' transfer timeout - transaction #%s stage '%s', good '%s', target reply %s, source reply %s",
+                tostring(self.shipName), tostring(tr.id), tostring(tr.stage), tostring(tr.good),
                 tostring(tr.targetReceived), tostring(tr.sourceReceived)))
 
-            if tr.stage == "recoverySwapping" then
-                self:setRuntimeError("Commander, the cargo recovery swap did not confirm. I'm aborting with the cargo left in the hold for verification."%_T)
-                return
-            end
-
-            if self.data.transactionTimeouts > MaxTransactionTimeouts then
-                self:setRuntimeError("Commander, the stock transfer keeps timing out. I'm aborting with any collected cargo still in the hold."%_T)
-                return
-            end
-
-            self:rewindPendingTransaction()
+            self:abandonTransfer(60)
         end
     end
 end
 
--- Drops an in-flight transaction and rewinds to the travel leg that issued it. Used when a
--- queued runSectorCode job can no longer answer -- it timed out, or the server restarted and
--- took the queue with it. Nothing is lost: the cargo already moved is on the ship, and the
--- replayed transfer clamps to the ship's real cargo and free space.
-function StockFactoryCommand:rewindPendingTransaction()
-    if not self.data.transaction then return end
-
+-- Drops an in-flight transfer and goes looking for another run. Used when a queued
+-- runSectorCode job can no longer answer -- it timed out, or the server restarted and took
+-- the queue with it.
+function StockFactoryCommand:abandonTransfer(cooldown)
     self.data.transaction = nil
+    self.data.currentHaul = nil
     self.data.probeRetries = 0
+    self.data.phase = "idle"
     self.data.timer = 0
-
-    local phase = self.data.phase
-    if phase == "transactingPickup" then
-        self.data.phase = self.data.currentHaul and "haulingToSource" or "idle"
-    elseif phase == "transactingDelivery" then
-        self.data.phase = self.data.currentHaul and "haulingToTarget" or "idle"
-    elseif phase == "transactingRecovery" then
-        self.data.phase = self.data.currentHaul and "recovering" or "idle"
-    end
+    self.data.rescanCooldown = cooldown or 0
 end
 
 function StockFactoryCommand:onRecall()
@@ -402,27 +386,23 @@ function StockFactoryCommand:onRestore()
     if type(self.config.ignoredGoods) ~= "table" then self.config.ignoredGoods = {} end
     self.data.nextTransactionId = self.data.nextTransactionId or 0
 
-    if self.data.transactionProtocolVersion == 2 and self.data.commandToken then
+    if self.data.transferProtocolVersion == 3 and self.data.commandToken then
         local owner = getParentFaction()
         local entry = ShipDatabaseEntry(owner.index, self.shipName)
         if valid(entry) then entry:setScriptValue(CommandLeaseKey, self.data.commandToken) end
 
         -- queued sector jobs don't survive a restart, so an in-flight transfer would
-        -- otherwise sit until it times out and recall a perfectly healthy command
-        if self.data.transaction and self.data.transaction.stage == "recoverySwapping" then
-            self:setRuntimeError("Commander, the server restarted during a cargo recovery swap. I'm aborting so the cargo in the hold can be verified safely."%_T)
-            return
-        end
-
-        self.data.transactionTimeouts = 0
-        self:rewindPendingTransaction()
+        -- otherwise sit until it times out
+        if self.data.transaction then self:abandonTransfer(0) end
         return
     end
 
+    -- Older protocols parked goods on the ship between two stations. Those can't be
+    -- reconciled here, so the cargo is handed to the recovery script and the ship recalled.
     local haul = self.data.currentHaul
     local amount = haul and (haul.carriedAmount or 0) or 0
     self.data.transaction = nil
-    self.data.transactionProtocolVersion = 2
+    self.data.transferProtocolVersion = 3
 
     if amount > 0 and not haul.cargoOnShip then
         local owner = getParentFaction()
@@ -484,149 +464,7 @@ function StockFactoryCommand:eligibleSources(good, target)
     return result
 end
 
-local function sameStation(left, right)
-    return left and right
-        and left.name == right.name
-        and left.factionIndex == right.factionIndex
-        and left.x == right.x
-        and left.y == right.y
-end
-
-local function stationRoute(station, script)
-    return {
-        name = station.name,
-        factionIndex = station.factionIndex,
-        x = station.x,
-        y = station.y,
-        script = script,
-    }
-end
-
-function StockFactoryCommand:recoveryExchangeCandidates(haul)
-    local candidates = {}
-    local failedTarget = haul.target
-
-    for good, script in pairs(failedTarget.sells or {}) do
-        if isGoodEligible(good)
-            and not isGoodIgnored(self.config, good)
-            and not (failedTarget.buys and failedTarget.buys[good]) then
-            for _, target in pairs(self:eligibleTargets(good)) do
-                if not sameStation(target, failedTarget) and target.buys[good] then
-                    table.insert(candidates, {
-                        good = good,
-                        source = stationRoute(failedTarget, script),
-                        target = stationRoute(target, target.buys[good]),
-                    })
-                end
-            end
-        end
-    end
-
-    return candidates
-end
-
-function StockFactoryCommand:startAlternateRecoveryDelivery()
-    local haul = self.data.currentHaul
-    if not haul then return end
-
-    local targets = {}
-    for _, target in pairs(self:eligibleTargets(haul.good)) do
-        if not sameStation(target, haul.target) then table.insert(targets, target) end
-    end
-
-    if #targets == 0 then
-        print(string.format("StockFactory recovery: '%s' found no alternate consumer for %i units of %s after '%s' filled",
-            tostring(self.shipName), haul.carriedAmount or 0, tostring(haul.good), tostring(haul.target.name)))
-        self:setRuntimeError("Commander, the delivery to %1% failed and I couldn't find another station that can accept the remaining cargo."%_T, haul.target.name)
-        return
-    end
-
-    local target = targets[random():getInt(1, #targets)]
-    print(string.format("StockFactory recovery: '%s' found no viable exchange; rerouting %i units of %s from '%s' to alternate consumer '%s' (%i:%i)",
-        tostring(self.shipName), haul.carriedAmount or 0, tostring(haul.good), tostring(haul.target.name),
-        tostring(target.name), target.x, target.y))
-    haul.target = stationRoute(target, target.buys[haul.good])
-    self.data.recovery = nil
-    self.data.phase = "haulingToTarget"
-    self.data.timer = 0
-end
-
-function StockFactoryCommand:startDeliveryRecovery()
-    local haul = self.data.currentHaul
-    if not haul then return end
-
-    if haul.recoveryUsed then
-        print(string.format("StockFactory recovery: '%s' recovery delivery of %i units of %s to '%s' failed; aborting without another recovery",
-            tostring(self.shipName), haul.carriedAmount or 0, tostring(haul.good), tostring(haul.target.name)))
-        self:setRuntimeError("Commander, the recovery delivery failed. I'm aborting with the remaining cargo in the hold."%_T)
-        return
-    end
-
-    haul.recoveryUsed = true
-    self:noteHaulFailure("target", haul.good, haul.target)
-
-    local candidates = self:recoveryExchangeCandidates(haul)
-    print(string.format("StockFactory recovery: '%s' delivery left %i units of %s aboard after '%s'; considering %i exchange route(s)",
-        tostring(self.shipName), haul.carriedAmount or 0, tostring(haul.good), tostring(haul.target.name), #candidates))
-    if #candidates == 0 then
-        self:startAlternateRecoveryDelivery()
-        return
-    end
-
-    self.data.recovery = {candidates = candidates}
-    self:beginRecoveryProbe()
-end
-
-function StockFactoryCommand:beginRecoveryProbe()
-    local haul = self.data.currentHaul
-    local recovery = self.data.recovery
-    local owner = getParentFaction()
-    if not haul or not recovery or not owner then return end
-
-    if not recovery.candidate then
-        if #recovery.candidates == 0 then
-            self:startAlternateRecoveryDelivery()
-            return
-        end
-        recovery.candidate = table.remove(recovery.candidates, random():getInt(1, #recovery.candidates))
-        print(string.format("StockFactory recovery: '%s' probing exchange %s from '%s' to '%s' (%i candidate(s) remain)",
-            tostring(self.shipName), tostring(recovery.candidate.good), tostring(recovery.candidate.source.name),
-            tostring(recovery.candidate.target.name), #recovery.candidates))
-    end
-
-    local candidate = recovery.candidate
-    if not StockFactoryUtility.canUseStation(owner, candidate.source.factionIndex, self.data.callingPlayer)
-        or not StockFactoryUtility.canUseStation(owner, candidate.target.factionIndex, self.data.callingPlayer) then
-        self:setRuntimeError("Commander, I no longer have permission to manage one of the stations needed for cargo recovery."%_T)
-        return
-    end
-
-    Galaxy():keepOrGetSector(candidate.source.x, candidate.source.y, SectorKeepSeconds)
-    Galaxy():keepOrGetSector(candidate.target.x, candidate.target.y, SectorKeepSeconds)
-    if not Galaxy():sectorLoaded(candidate.source.x, candidate.source.y)
-        or not Galaxy():sectorLoaded(candidate.target.x, candidate.target.y) then
-        self.data.phase = "recovering"
-        return
-    end
-
-    self.data.nextTransactionId = (self.data.nextTransactionId or 0) + 1
-    local transactionId = self.data.nextTransactionId
-    self.data.transaction = {
-        id = transactionId,
-        stage = "recoveryProbing",
-        good = candidate.good,
-        sourceReceived = false,
-        targetReceived = false,
-    }
-
-    runSectorCode(candidate.source.x, candidate.source.y, true, probeCode, "run", owner.index, self.shipName, candidate.source.factionIndex, candidate.source.name, candidate.source.script, candidate.good, "reportRecoverySourceStock", self.data.commandToken, transactionId, self.data.callingPlayer)
-    runSectorCode(candidate.target.x, candidate.target.y, true, probeCode, "run", owner.index, self.shipName, candidate.target.factionIndex, candidate.target.name, candidate.target.script, candidate.good, "reportRecoveryTargetStock", self.data.commandToken, transactionId, self.data.callingPlayer)
-
-    self.data.phase = "transactingRecovery"
-    self.data.timer = 0
-end
-
--- travel time for one leg of the haul
+-- travel time for one run of the haul
 function StockFactoryCommand:estimateTravelTime()
     return random():getInt(MinTravelMinutes, MaxTravelMinutes) * 60
 end
@@ -756,12 +594,11 @@ function StockFactoryCommand:planNextHaul()
                 script = target.buys[good],
             },
             travelTime = travelTime,
-            pickupTravelTime = travelTime,
-            deliveryTravelTime = travelTime,
-            carriedAmount = 0,
+            -- purely decorative: makes the ferry stop off at the producer on the way
+            visitSource = random():test(SourceVisitChance),
         }
 
-        self.data.phase = "haulingToSource"
+        self.data.phase = "travelling"
         self.data.timer = 0
         self.data.reportedNoRoutes = nil
         return
@@ -871,6 +708,9 @@ function run(faction, shipName, stationFaction, stationName, script, goodName, c
 end
 ]]
 
+-- Goods never sit on the ship: they are taken out of the source station's bay and pushed
+-- into the target station's bay within the same few frames, while both sectors are held in
+-- memory. This mirrors vanilla's SupplyCommand.
 local removeCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
@@ -908,8 +748,11 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount, c
         return
     end
 
-    amount = math.min(amount, math.floor(ship:getFreeCargoSpace() / math.max(good.size or 1, 0.0001)))
-    local removed = StockFactoryUtility.transferToShip(CargoBay(station), ship, tradingGood(good), amount)
+    local cargoBay = CargoBay(station)
+    local exact = tradingGood(good)
+    local before = cargoBay:getNumCargos(exact)
+    cargoBay:removeCargo(exact, amount)
+    local removed = before - cargoBay:getNumCargos(exact)
 
     invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsRemoved", commandToken, transactionId, goodName, removed)
 end
@@ -952,38 +795,37 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount, c
         return
     end
 
-    local added, notAdded = StockFactoryUtility.transferToStation(CargoBay(station), ship, tradingGood(good), amount)
+    -- another hauler can fill the last of the room between our probe and this frame, so
+    -- only what the bay really took counts as delivered
+    local cargoBay = CargoBay(station)
+    local exact = tradingGood(good)
+    local before = cargoBay:getNumCargos(exact)
+    cargoBay:addCargo(exact, amount)
+    local added = cargoBay:getNumCargos(exact) - before
 
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsDelivered", commandToken, transactionId, goodName, added, notAdded)
+    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsDelivered", commandToken, transactionId, goodName, added, amount - added)
 end
 ]]
 
-local exchangeCode = [[
+-- Whatever the consumer could not take is pushed straight back into the producer's bay, so
+-- an overdelivery never destroys goods.
+local returnCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 include("stringutility")
 local StockFactoryUtility = include("stockfactoryutility")
 ]] .. goodsHelperCode .. [[
 
-function run(faction, shipName, stationFaction, stationName, deliveredGoodName, deliveredAmount, pickedUpGoodName, pickedUpAmount, commandToken, transactionId, callingPlayer)
-    local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) or not StockFactoryUtility.hasCommandLease(ship, commandToken) then return end
-
-    local owner = Galaxy():findFaction(faction)
-    if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, I no longer have permission to manage station '%s'."%_T, stationName)
+function run(faction, shipName, stationFaction, stationName, goodName, amount)
+    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
+    local good = goods[goodName]
+    if not valid(station) or not good then
+        print(string.format("StockFactory: '%s' could not return %i units of %s to '%s'",
+            tostring(shipName), amount, tostring(goodName), tostring(stationName)))
         return
     end
 
-    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
-    local deliveredGood = goods[deliveredGoodName]
-    local pickedUpGood = goods[pickedUpGoodName]
-    local swapped = valid(station)
-        and deliveredGood
-        and pickedUpGood
-        and StockFactoryUtility.exchangeCargo(CargoBay(station), ship, tradingGood(deliveredGood), deliveredAmount, tradingGood(pickedUpGood), pickedUpAmount)
-
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onCargoExchangeComplete", commandToken, transactionId, swapped and true or false)
+    CargoBay(station):addCargo(tradingGood(good), amount)
 end
 ]]
 
@@ -1010,9 +852,14 @@ function StockFactoryCommand:querySectors(needSource, needTarget)
     return true
 end
 
-function StockFactoryCommand:beginPickupTransaction()
+function StockFactoryCommand:beginTransfer()
     local haul = self.data.currentHaul
     local owner = getParentFaction()
+    if not haul or not owner then
+        self.data.phase = "idle"
+        return
+    end
+
     local t = haul.target
     local s = haul.source
 
@@ -1025,28 +872,23 @@ function StockFactoryCommand:beginPickupTransaction()
     end
 
     if not t.script or not s.script then
-        -- we don't know which scripts trade the good; skip this haul
+        -- we don't know which scripts trade the good; skip this run
         print(string.format("StockFactory: '%s' dropped %s - no trading script (source '%s' %s, target '%s' %s)",
             tostring(self.shipName), tostring(haul.good),
             tostring(s.name), tostring(s.script), tostring(t.name), tostring(t.script)))
 
-        self.data.currentHaul = nil
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 30
+        self:abandonTransfer(30)
         return
     end
 
     if not self:querySectors(true, true) then
-        -- sectors not loaded yet: keep trying for a while, then give up this haul
+        -- sectors not loaded yet: keep trying for a while, then give up this run
         self.data.probeRetries = (self.data.probeRetries or 0) + 1
         if self.data.probeRetries > 15 then
-            print(string.format("StockFactory: '%s' gave up loading %i:%i / %i:%i for a %s pickup",
+            print(string.format("StockFactory: '%s' gave up loading %i:%i / %i:%i for a %s transfer",
                 tostring(self.shipName), s.x, s.y, t.x, t.y, tostring(haul.good)))
 
-            self.data.probeRetries = 0
-            self.data.currentHaul = nil
-            self.data.phase = "idle"
-            self.data.rescanCooldown = 60
+            self:abandonTransfer(60)
         end
         return
     end
@@ -1072,50 +914,7 @@ function StockFactoryCommand:beginPickupTransaction()
         tostring(s.name), s.x, s.y, tostring(s.script),
         tostring(t.name), t.x, t.y, tostring(t.script)))
 
-    self.data.phase = "transactingPickup"
-    self.data.timer = 0
-end
-
-function StockFactoryCommand:beginDeliveryTransaction()
-    local haul = self.data.currentHaul
-    local owner = getParentFaction()
-    if not haul or not owner then return end
-
-    if not self:ensureCommandLease() then return end
-
-    local amount = haul.carriedAmount or 0
-    if amount <= 0 then
-        self.data.currentHaul = nil
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 0
-        return
-    end
-
-    if not StockFactoryUtility.canUseStation(owner, haul.target.factionIndex, self.data.callingPlayer) then
-        self:setRuntimeError("Commander, I no longer have permission to manage the destination station. I'm aborting with the collected cargo still in the hold."%_T)
-        return
-    end
-
-    if not self:querySectors(false, true) then
-        self.data.probeRetries = (self.data.probeRetries or 0) + 1
-        if self.data.probeRetries > 15 then
-            self.data.probeRetries = 0
-            self:setRuntimeError("Commander, I couldn't load the destination sector. I'm aborting with the collected cargo still in the hold."%_T)
-        end
-        return
-    end
-    self.data.probeRetries = 0
-
-    local t = haul.target
-    self.data.nextTransactionId = (self.data.nextTransactionId or 0) + 1
-    local transactionId = self.data.nextTransactionId
-    self.data.transaction = {id = transactionId, stage = "delivering", good = haul.good, amount = amount}
-    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, haul.good, amount, self.data.commandToken, transactionId, self.data.callingPlayer)
-
-    print(string.format("StockFactory: '%s' delivering #%i - %i units of %s to '%s' (%i:%i)",
-        tostring(self.shipName), transactionId, amount, tostring(haul.good), tostring(t.name), t.x, t.y))
-
-    self.data.phase = "transactingDelivery"
+    self.data.phase = "transferring"
     self.data.timer = 0
 end
 
@@ -1159,83 +958,6 @@ function StockFactoryCommand:reportSourceStock(commandToken, transactionId, good
     self:tryExecuteHaul()
 end
 
-function StockFactoryCommand:acceptRecoveryStockReport(commandToken, transactionId, good)
-    local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken
-        or not transaction
-        or transaction.id ~= transactionId
-        or transaction.good ~= good
-        or transaction.stage ~= "recoveryProbing" then
-        return nil
-    end
-    return transaction
-end
-
-function StockFactoryCommand:reportRecoverySourceStock(commandToken, transactionId, good, stock, maxStock)
-    local transaction = self:acceptRecoveryStockReport(commandToken, transactionId, good)
-    if not transaction then return end
-    transaction.sourceStock = stock or 0
-    transaction.sourceReceived = true
-    self:tryExecuteRecoveryExchange()
-end
-
-function StockFactoryCommand:reportRecoveryTargetStock(commandToken, transactionId, good, stock, maxStock)
-    local transaction = self:acceptRecoveryStockReport(commandToken, transactionId, good)
-    if not transaction then return end
-    transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
-    transaction.targetReceived = true
-    self:tryExecuteRecoveryExchange()
-end
-
-function StockFactoryCommand:advanceRecoveryCandidate()
-    local recovery = self.data.recovery
-    if recovery then recovery.candidate = nil end
-    self.data.transaction = nil
-    self.data.transactionTimeouts = 0
-    self.data.phase = "recovering"
-    self.data.timer = 0
-end
-
-function StockFactoryCommand:tryExecuteRecoveryExchange()
-    local transaction = self.data.transaction
-    if not transaction or not transaction.sourceReceived or not transaction.targetReceived then return end
-
-    local haul = self.data.currentHaul
-    local recovery = self.data.recovery
-    local candidate = recovery and recovery.candidate
-    local owner = getParentFaction()
-    if not haul or not candidate or not owner then return end
-
-    local originalSize = goods[haul.good] and goods[haul.good].size or 1
-    local replacementSize = goods[candidate.good] and goods[candidate.good].size or 1
-    local originalAmount = haul.carriedAmount or 0
-    local minimumAmount = math.ceil(originalAmount * originalSize / replacementSize)
-    local ship = ShipDatabaseEntry(owner.index, self.shipName)
-    local maximumAmount = valid(ship) and math.floor((originalAmount * originalSize + ship:getFreeCargoSpace()) / replacementSize) or 0
-    local amount = math.min(transaction.sourceStock or 0, transaction.targetRoom or 0, maximumAmount)
-
-    if amount < minimumAmount then
-        print(string.format("StockFactory recovery: '%s' rejected exchange %s from '%s' - need >= %i units (%g space), stock %i, consumer room %i, ship limit %i",
-            tostring(self.shipName), tostring(candidate.good), tostring(candidate.source.name), minimumAmount,
-            originalAmount * originalSize, transaction.sourceStock or 0, transaction.targetRoom or 0, maximumAmount))
-        self:advanceRecoveryCandidate()
-        return
-    end
-
-    print(string.format("StockFactory recovery: '%s' swapping %i %s for %i %s at '%s'; replacement consumer '%s' confirmed room %i",
-        tostring(self.shipName), originalAmount, tostring(haul.good), amount, tostring(candidate.good),
-        tostring(candidate.source.name), tostring(candidate.target.name), transaction.targetRoom or 0))
-    transaction.stage = "recoverySwapping"
-    transaction.amount = amount
-    transaction.originalGood = haul.good
-    transaction.originalAmount = originalAmount
-    runSectorCode(candidate.source.x, candidate.source.y, true, exchangeCode, "run", owner.index, self.shipName,
-        candidate.source.factionIndex, candidate.source.name, haul.good, originalAmount, candidate.good, amount,
-        self.data.commandToken, transaction.id, self.data.callingPlayer)
-    self.data.phase = "transactingRecovery"
-    self.data.timer = 0
-end
-
 function StockFactoryCommand:tryExecuteHaul()
     local tr = self.data.transaction
     if not tr or not tr.targetReceived or not tr.sourceReceived then return end
@@ -1257,7 +979,7 @@ function StockFactoryCommand:tryExecuteHaul()
     end
 
     -- never haul more than the station actually needs (its free room), never more
-    -- than the source has, and never more than the ship can carry
+    -- than the source has, and never more than the ship could carry in one run
     local amount = math.min(tr.targetRoom, tr.sourceStock, cargoUnits)
 
     if not amount or amount <= 0 then
@@ -1270,10 +992,7 @@ function StockFactoryCommand:tryExecuteHaul()
         if (tr.sourceStock or 0) <= 0 then self:noteHaulFailure("source", good, haul.source) end
         if (tr.targetRoom or 0) <= 0 then self:noteHaulFailure("target", good, haul.target) end
 
-        self.data.currentHaul = nil
-        self.data.transaction = nil
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 5
+        self:abandonTransfer(5)
         return
     end
 
@@ -1288,74 +1007,24 @@ function StockFactoryCommand:onGoodsRemoved(commandToken, transactionId, good, r
     local transaction = self.data.transaction
     if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "removing" then return end
 
-    self.data.transaction = nil
-    self.data.transactionTimeouts = 0
-
     if (removed or 0) <= 0 then
-        -- source was empty at pickup time (produced nothing yet)
+        -- source was empty at transfer time (produced nothing yet)
         -- retry with a different random pair soon
         self:noteHaulFailure("source", good, haul.source)
-        self.data.currentHaul = nil
-        self.data.phase = "idle"
-        self.data.rescanCooldown = 5
+        self:abandonTransfer(5)
         return
     end
 
-    -- log the pickup to economy chat
-    local goodName = goodDisplayName(good, removed)
-    local sourceStationName = haul.source.name
-    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% picked up %4% units of %5% from %6%."%_T,
-        haul.source.x, haul.source.y, self.shipName, removed, goodName, sourceStationName)
-
-    haul.carriedAmount = removed
-    haul.cargoOnShip = true
-    self.data.phase = "haulingToTarget"
+    transaction.stage = "delivering"
+    transaction.amount = removed
     self.data.timer = 0
-end
 
-function StockFactoryCommand:onCargoExchangeComplete(commandToken, transactionId, swapped)
-    local owner = getParentFaction()
-    local haul = self.data.currentHaul
-    local recovery = self.data.recovery
-    local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken
-        or not haul
-        or not recovery
-        or not transaction
-        or transaction.id ~= transactionId
-        or transaction.stage ~= "recoverySwapping" then
-        return
-    end
+    local t = haul.target
+    runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, good, removed, self.data.commandToken, transactionId, self.data.callingPlayer)
 
-    self.data.transaction = nil
-    self.data.transactionTimeouts = 0
-    if not swapped then
-        print(string.format("StockFactory recovery: '%s' exchange transaction #%i did not complete safely; aborting",
-            tostring(self.shipName), transactionId))
-        self:setRuntimeError("Commander, the cargo recovery swap could not be completed safely. I'm aborting with the cargo in the hold."%_T)
-        return
-    end
-
-    local candidate = recovery.candidate
-    local originalGoodName = goodDisplayName(haul.good, transaction.originalAmount)
-    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% delivered %4% units of %5% to %6%."%_T,
-        haul.target.x, haul.target.y, self.shipName, transaction.originalAmount, originalGoodName, haul.target.name)
-    self:clearSourceFailures(haul.target)
-
-    local replacementGoodName = goodDisplayName(candidate.good, transaction.amount)
-    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% picked up %4% units of %5% from %6%."%_T,
-        candidate.source.x, candidate.source.y, self.shipName, transaction.amount, replacementGoodName, candidate.source.name)
-
-    haul.good = candidate.good
-    haul.source = candidate.source
-    haul.target = candidate.target
-    haul.carriedAmount = transaction.amount
-    haul.cargoOnShip = true
-    self.data.recovery = nil
-    self.data.phase = "haulingToTarget"
-    self.data.timer = 0
-    print(string.format("StockFactory recovery: '%s' exchange succeeded; carrying %i %s to '%s' (%i:%i)",
-        tostring(self.shipName), haul.carriedAmount, tostring(haul.good), tostring(haul.target.name), haul.target.x, haul.target.y))
+    print(string.format("StockFactory: '%s' moving #%i - %i units of %s from '%s' (%i:%i) to '%s' (%i:%i)",
+        tostring(self.shipName), transactionId, removed, tostring(good),
+        tostring(haul.source.name), haul.source.x, haul.source.y, tostring(t.name), t.x, t.y))
 end
 
 function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good, added, notAdded)
@@ -1364,32 +1033,29 @@ function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good,
     local transaction = self.data.transaction
     if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "delivering" then return end
 
-    self.data.transaction = nil
-    self.data.transactionTimeouts = 0
+    if (added or 0) > 0 then
+        owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% transferred %4% units of %5% from %6% to %7%."%_T,
+            haul.target.x, haul.target.y, self.shipName, added, goodDisplayName(good, added),
+            haul.source.name, haul.target.name)
 
-    local amountToDeliver = (added or 0) + (notAdded or 0)
-    haul.carriedAmount = notAdded or 0
-
-    if (notAdded or 0) > 0 or (added or 0) <= 0 then
-        print(string.format("StockFactory recovery: '%s' delivery of %i %s to '%s' accepted %i and left %i aboard",
-            tostring(self.shipName), amountToDeliver, tostring(good), tostring(haul.target.name), added or 0, notAdded or 0))
-        self:startDeliveryRecovery()
-        return
+        self:clearSourceFailures(haul.target)
     end
 
-    -- full delivery succeeded: log it and continue
-    local goodName = goodDisplayName(good, added)
-    local targetStationName = haul.target.name
-    owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% delivered %4% units of %5% to %6%."%_T,
-        haul.target.x, haul.target.y, self.shipName, added, goodName, targetStationName)
+    if (notAdded or 0) > 0 then
+        -- another hauler took the last of the room in the same few frames; nothing is
+        -- destroyed, the remainder goes straight back to the producer
+        print(string.format("StockFactory: '%s' returned %i units of %s to '%s' - '%s' only took %i",
+            tostring(self.shipName), notAdded, tostring(good), tostring(haul.source.name),
+            tostring(haul.target.name), added or 0))
 
-    self:clearSourceFailures(haul.target)
+        self:noteHaulFailure("target", good, haul.target)
 
-    haul.carriedAmount = 0
-    self.data.currentHaul = nil
-    self.data.phase = "idle"
-    -- no trip home: the next haul's outbound leg already covers target -> next source
-    self.data.rescanCooldown = 0
+        local s = haul.source
+        runSectorCode(s.x, s.y, true, returnCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, good, notAdded)
+    end
+
+    -- no trip home: the next run's travel leg already covers target -> next source
+    self:abandonTransfer(0)
 end
 
 function StockFactoryCommand:transactionError(commandToken, transactionId, msg, ...)
@@ -1830,10 +1496,10 @@ local ferryReplyCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
 
-function run(faction, shipName, nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
+function run(faction, shipName, nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter, transitLinger)
     for _, entity in pairs({Sector():getEntitiesByScriptValue("displayed_faction")}) do
         if entity:getValue("displayed_faction") == faction and entity.name == shipName then
-            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter)
+            entity:invokeFunction("ai/stockfactoryferry.lua", "setNextHop", nextX, nextY, useGate, dockFaction, dockName, dockX, dockY, hasDockTarget, loiter, transitLinger)
         end
     end
 end
@@ -1881,41 +1547,146 @@ local function nextHopOnTree(cameFrom, anchorX, anchorY, fromX, fromY, toX, toY)
     return nil, nil, false
 end
 
+-- the sectors a ferry passes through going from one sector to another, starting at `from`
+local function routePath(cameFrom, anchorX, anchorY, fromX, fromY, toX, toY)
+    local path = {{x = fromX, y = fromY}}
+    local cx, cy = fromX, fromY
+
+    for _ = 1, MaxGateJumps * 2 + 2 do
+        if cx == toX and cy == toY then break end
+        local nx, ny = nextHopOnTree(cameFrom, anchorX, anchorY, cx, cy, toX, toY)
+        if not nx then break end
+        cx, cy = nx, ny
+        table.insert(path, {x = cx, y = cy})
+    end
+
+    return path
+end
+
+
+---------------------------------------------------------------------
+-- ferry visuals
+---------------------------------------------------------------------
+--
+-- A run is split into two windows. During the first the ferry travels: it patrols transit
+-- sectors along the gate route and, on some runs, makes a decorative stop at the producer.
+-- During the second it is parked at the consumer's sector so a watching player sees it fly
+-- in and dock just as the transfer resolves.
+
+-- start of the delivery approach, as an offset into the run
+function StockFactoryCommand:approachStart()
+    local haul = self.data.currentHaul
+    if not haul then return 0 end
+
+    local legTime = haul.travelTime or 60
+    return math.max(legTime * 0.5, legTime - ApproachSeconds)
+end
+
+function StockFactoryCommand:isApproaching()
+    if self.data.phase ~= "travelling" then return false end
+    return (self.data.timer or 0) >= self:approachStart()
+end
+
+-- True while a spawned ferry has recently reported in from the consumer's sector. The AI
+-- script only runs on an appearance, and appearances only spawn where a player is, so this
+-- doubles as "someone is watching the delivery".
+function StockFactoryCommand:ferryIsApproachingTarget()
+    local haul = self.data.currentHaul
+    local seen = self.data.ferrySector
+    if not haul or not seen then return false end
+
+    if seen.x ~= haul.target.x or seen.y ~= haul.target.y then return false end
+
+    local age = (self.data.clock or 0) - (seen.clock or 0)
+    return age >= 0 and age <= ApproachSeconds + DockGraceSeconds
+end
+
+-- Where the appearance system should place the ferry. Returning nil means "nowhere", which
+-- vanilla treats as no appearance this tick.
+function StockFactoryCommand:getAppearanceSector()
+    local anchor = self.data.anchor or {}
+    local haul = self.data.currentHaul
+
+    if not haul or self.data.phase == "idle" then
+        if anchor.x then return anchor.x, anchor.y end
+        return nil
+    end
+
+    if self:isApproaching() or self.data.phase == "transferring" then
+        return haul.target.x, haul.target.y
+    end
+
+    if haul.visitSource then
+        return haul.source.x, haul.source.y
+    end
+
+    -- somewhere along the gate route, advancing with the run so the trip reads as a trip
+    local path = routePath(self.data.gateCameFrom or {}, anchor.x, anchor.y,
+        haul.source.x, haul.source.y, haul.target.x, haul.target.y)
+
+    local approach = self:approachStart()
+    local progress = approach > 0 and math.min(1, (self.data.timer or 0) / approach) or 0
+    local step = math.floor(progress * (#path - 1)) + 1
+
+    local sector = path[math.max(1, math.min(#path, step))]
+    return sector.x, sector.y
+end
+
 -- given the sector a ferry is in, return the next sector it should head towards
--- (one gate hop) and whether that hop uses a gate. Hub-and-spoke loop:
--- target -> supplier -> target -> ...
+-- (one gate hop) and whether that hop uses a gate
 function StockFactoryCommand:computeFerryNextHop(sx, sy)
     local haul = self.data.currentHaul
     if not haul or not haul.source or not haul.target then return nil, nil, false end
 
+    local phase = self.data.phase
+    if phase ~= "travelling" and phase ~= "transferring" then return nil, nil, false end
+
     local cameFrom = self.data.gateCameFrom or {}
     local anchor = self.data.anchor or {}
-    local destX, destY
 
-    local phase = self.data.phase
-    if phase == "haulingToSource" or phase == "transactingPickup" then
+    local destX, destY = haul.target.x, haul.target.y
+    if not self:isApproaching() and phase == "travelling" and haul.visitSource then
         destX, destY = haul.source.x, haul.source.y
-    elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
-        destX, destY = haul.target.x, haul.target.y
-    else
-        return nil, nil, false
     end
 
     return nextHopOnTree(cameFrom, anchor.x, anchor.y, sx, sy, destX, destY)
 end
 
+-- The consumer is the only stop that matters, and docking it is what triggers the transfer.
+-- The producer stop is decorative and only offered on runs that rolled for it.
 function StockFactoryCommand:getFerryDockTarget()
     local haul = self.data.currentHaul
     if not haul then return nil end
 
-    local phase = self.data.phase
-    if phase == "haulingToSource" or phase == "transactingPickup" then
-        return haul.source
-    elseif phase == "haulingToTarget" or phase == "transactingDelivery" then
+    if self:isApproaching() or self.data.phase == "transferring" then
         return haul.target
     end
 
+    if self.data.phase == "travelling" and haul.visitSource then
+        return haul.source
+    end
+
     return nil
+end
+
+-- How long the ferry may patrol a transit sector before moving on. It occupies the only
+-- appearance slot the ship has, so it must be free again in time for the delivery approach.
+function StockFactoryCommand:ferryTransitLinger()
+    if self.data.phase ~= "travelling" then return 0 end
+
+    local slack = self:approachStart() - (self.data.timer or 0)
+    return math.max(0, math.min(MaxTransitLinger, slack))
+end
+
+-- Reported by the ferry AI the moment it finishes docking. Landing on the consumer during
+-- the approach window is what makes the transfer message coincide with the visible dock.
+function StockFactoryCommand:onFerryDocked(x, y, stationName)
+    local haul = self.data.currentHaul
+    if not haul or self.data.phase ~= "travelling" then return end
+    if haul.target.x ~= x or haul.target.y ~= y or haul.target.name ~= stationName then return end
+    if not self:isApproaching() then return end
+
+    self:beginTransfer()
 end
 
 -- invoked by the ferry appearance to learn which gate to use; replies straight
@@ -1923,6 +1694,8 @@ end
 function StockFactoryCommand:onFerryRouteRequest(sx, sy)
     local owner = getParentFaction()
     if not owner then return end
+
+    self.data.ferrySector = {x = sx, y = sy, clock = self.data.clock or 0}
 
     local nextX, nextY, useGate = self:computeFerryNextHop(sx, sy)
     local dockTarget = self:getFerryDockTarget()
@@ -1938,7 +1711,8 @@ function StockFactoryCommand:onFerryRouteRequest(sx, sy)
         dockTarget and dockTarget.x or 0,
         dockTarget and dockTarget.y or 0,
         dockTarget and true or false,
-        loiter)
+        loiter,
+        self:ferryTransitLinger())
 end
 
 
