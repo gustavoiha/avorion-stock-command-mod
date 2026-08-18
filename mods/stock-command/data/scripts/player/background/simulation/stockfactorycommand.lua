@@ -79,8 +79,12 @@ local function skey(x, y)
     return x .. ":" .. y
 end
 
+local function stationSuffix(station)
+    return tostring(station.factionIndex) .. "|" .. station.name .. "@" .. skey(station.x, station.y)
+end
+
 local function failureKey(kind, good, station)
-    return kind .. "|" .. good .. "|" .. tostring(station.factionIndex) .. "|" .. station.name .. "@" .. skey(station.x, station.y)
+    return kind .. "|" .. good .. "|" .. stationSuffix(station)
 end
 
 -- all eligible goods present across any station in the list (union of buys and sells)
@@ -481,6 +485,20 @@ function StockFactoryCommand:noteHaulFailure(kind, good, station)
     end
 
     failures[failureKey(kind, good, station)] = (self.data.clock or 0) + RecentFailureSeconds
+end
+
+-- A station we just delivered inputs to can start producing again, so it stops counting as
+-- a known-dry source without waiting out the timer.
+function StockFactoryCommand:clearSourceFailures(station)
+    local failures = self.data.recentFailures
+    if not failures or not station or not station.name then return end
+
+    local suffix = "|" .. stationSuffix(station)
+    for key in pairs(failures) do
+        if key:sub(1, 7) == "source|" and key:sub(-#suffix) == suffix then
+            failures[key] = nil
+        end
+    end
 end
 
 -- Drops expired entries and returns what is left, or nil when there is nothing to avoid.
@@ -1062,6 +1080,8 @@ function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good,
     local targetStationName = haul.target.name
     owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% delivered %4% units of %5% to %6%."%_T,
         haul.target.x, haul.target.y, self.shipName, added, goodName, targetStationName)
+
+    self:clearSourceFailures(haul.target)
 
     haul.carriedAmount = 0
     self.data.currentHaul = nil

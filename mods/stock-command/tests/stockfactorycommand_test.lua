@@ -194,6 +194,21 @@ expiring:planNextHaul()
 check("an expired failure no longer blocks the pair",
     expiring.data.phase == "haulingToSource" and expiring.data.currentHaul.good == "Iron")
 
+-- delivering inputs to a station can restart its production, so it stops counting as dry
+local restocked = freshPlanner()
+restocked.data.commandToken = "current-command"
+restocked:noteHaulFailure("source", "Iron", restocked.data.stations[1])
+restocked:noteHaulFailure("target", "Steel", restocked.data.stations[1])
+restocked.data.currentHaul = {good = "Steel", source = restocked.data.stations[2], target = restocked.data.stations[1], carriedAmount = 10}
+restocked.data.transaction = {id = 3, stage = "delivering", good = "Steel"}
+restocked:onGoodsDelivered("current-command", 3, "Steel", 10, 0)
+check("delivering to a station leaves its other blocks alone", tablelength(restocked.data.recentFailures) == 1)
+restocked:planNextHaul()
+check("delivering to a station clears its dry-source block",
+    restocked.data.phase == "haulingToSource"
+        and restocked.data.currentHaul.good == "Iron"
+        and restocked.data.currentHaul.source.name == "Iron Mine")
+
 local overflowing = freshPlanner()
 overflowing.data.recentFailures = {}
 for entry = 1, 65 do
