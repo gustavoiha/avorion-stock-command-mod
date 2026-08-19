@@ -1066,7 +1066,7 @@ function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good,
     if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "delivering" then return end
 
     if (added or 0) > 0 then
-        owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% transferred %4% units of %5% from %6% to %7%."%_T,
+        owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% transferred %4% %5% from %6% to %7%."%_T,
             haul.target.x, haul.target.y, self.shipName, added, goodDisplayName(good, added),
             haul.source.name, haul.target.name)
 
