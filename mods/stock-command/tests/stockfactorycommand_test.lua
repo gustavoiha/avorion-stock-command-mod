@@ -232,6 +232,53 @@ for entry = 1, 65 do
 end
 check("an oversized failure table is discarded wholesale", overflowing:pruneHaulFailures() == nil)
 
+print("\n[target bay space]")
+
+-- the station's quota for a good says nothing about its bay, which can be full of anything
+local function haulWith(transaction)
+    local instance = freshPlanner()
+    instance.data.currentHaul = {good = "Iron", source = instance.data.stations[1], target = instance.data.stations[2]}
+    transaction.id = 1
+    transaction.stage = "probing"
+    transaction.good = "Iron"
+    transaction.targetReceived = true
+    transaction.sourceReceived = true
+    instance.data.transaction = transaction
+    sectorCalls = {}
+    instance:tryExecuteHaul()
+    return instance
+end
+
+local reporting = freshPlanner()
+reporting.data.currentHaul = {good = "Iron", source = reporting.data.stations[1], target = reporting.data.stations[2]}
+reporting.data.transaction = {id = 20, stage = "probing", good = "Iron", targetReceived = false, sourceReceived = false}
+reporting:reportTargetStock("current-command", 20, "Iron", 20, 100, 250)
+check("a target probe records both the quota and the bay space",
+    reporting.data.transaction.targetRoom == 80 and reporting.data.transaction.targetFreeSpace == 250)
+
+local physicallyFull = haulWith({targetRoom = 500, sourceStock = 900, targetFreeSpace = 0})
+check("a target with quota but no bay space hauls nothing",
+    physicallyFull.data.transaction == nil and #sectorCalls == 0)
+check("a physically full target is remembered", tablelength(physicallyFull.data.recentFailures) == 1)
+
+local cramped = haulWith({targetRoom = 500, sourceStock = 900, targetFreeSpace = 40})
+check("the haul is capped by the target's free bay space",
+    cramped.data.transaction.stage == "removing" and cramped.data.transaction.amount == 40)
+
+goods.Iron.size = 2
+local bulky = haulWith({targetRoom = 500, sourceStock = 900, targetFreeSpace = 45})
+check("bay space is converted to whole units of the good",
+    bulky.data.transaction.amount == 22)
+goods.Iron.size = 1
+
+local unknownSpace = haulWith({targetRoom = 30, sourceStock = 900, targetFreeSpace = -1})
+check("a station that reports no bay is not capped by space",
+    unknownSpace.data.transaction.amount == 30)
+
+local roomIsStillTheCap = haulWith({targetRoom = 15, sourceStock = 900, targetFreeSpace = 400})
+check("plenty of bay space does not lift the good's own quota",
+    roomIsStillTheCap.data.transaction.amount == 15)
+
 print("\n[transfer]")
 
 local moving = freshPlanner()
