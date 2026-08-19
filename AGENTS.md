@@ -1,37 +1,45 @@
-# AGENTS.md - Global rules for AI agents in this repository
+# AGENTS.md — rules for AI agents in this repository
 
-This repository is a multi-mod workspace for Avorion mods.
-Read and obey these global rules before taking any action.
+A multi-mod workspace for Avorion. Each mod lives in `mods/<mod-name>/`.
 
-## 1. Never modify the Steam game installation
-
-The Avorion game installation is read-only reference material:
+## 1. Never write to the Steam installation
 
 ```
 $HOME/Library/Application Support/Steam/steamapps/common/Avorion
 ```
 
-Do not create, edit, move, rename, or delete files there.
+This is read-only reference material. Read vanilla scripts freely for API,
+architecture, and behavior; never create, edit, move, rename, or delete anything
+there. If a task appears to need a vanilla change, extend it from a mod instead.
 
-- Allowed: read-only access for API or architecture reference.
-- Allowed: read-only access to Avorion installation scripts for API,
-  architecture, and behavior reference.
-- Forbidden: any write operation in the Steam installation.
+Likewise, keep changes inside this repository unless the user asks otherwise.
 
-If a task appears to require changing vanilla game files, stop and implement the
-change through the mod extension mechanism inside this repository instead.
+## 2. Mod mechanism
 
-## 2. Keep all changes inside this repository
+Mods mirror Avorion's `data/` tree and extend vanilla scripts by name-clashing
+Lua injection before the final `return`. Keep `modinfo.lua` valid, preserve
+`-- namespace ...` comments, and keep UI code inside `if onClient() then`.
+Prefer additive, reversible changes.
 
-Do not create or modify files outside this repository unless the user explicitly
-asks for it.
+## 3. Installing a mod locally
 
-## 3. Mod layout
+Avorion loads mods from `~/.avorion/mods/`. Symlink the mod folder under its
+`modinfo.lua` name, then add that name to the `enabled` list in
+`~/.avorion/mods/modconfig.lua`:
 
-Each mod lives in its own folder under `mods/`.
-Mod-specific conventions and constraints belong in that mod folder's own
-`AGENTS.md` file.
+```bash
+ln -s "$PWD/mods/stock-command" ~/.avorion/mods/stock_command
+```
 
-## 4. Safety
+All four mods are already symlinked, so only `modconfig.lua` decides what loads.
 
-Prefer reversible local actions. Ask before destructive operations.
+## 4. Mod-specific notes
+
+- `core-distance-label`: keep the readout at a map edge, never as a tooltip next
+  to the sector or the cursor.
+- `production-capacity-stats`: keep the production math in sync with vanilla
+  `entity/merchants/factory.lua`. The game uses `max(MinimumCapacity, plan
+  capacity)`, not addition, so anything at or below the 100 baseline requires
+  `0`. Never show it for crafts that don't produce goods.
+
+Ask before destructive operations.
