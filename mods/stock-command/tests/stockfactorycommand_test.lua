@@ -59,10 +59,10 @@ end
 ChatMessageType = {Error = 1, Normal = 2, Economy = 3, Information = 4}
 
 -- captures every sector job the command dispatches, so the tests can assert which sector
--- was addressed without running any of the embedded code
+-- was addressed, and with what, without running any of the embedded code
 local sectorCalls = {}
-function runSectorCode(x, y)
-    table.insert(sectorCalls, {x = x, y = y})
+function runSectorCode(x, y, keep, code, entry, ...)
+    table.insert(sectorCalls, {x = x, y = y, code = code, args = {...}})
 end
 
 function Galaxy()
@@ -312,6 +312,89 @@ check("goods the consumer could not take go back to the producer",
     #sectorCalls == 1 and sectorCalls[1].x == 0 and sectorCalls[1].y == 0)
 check("a consumer that filled up is remembered", tablelength(overdelivered.data.recentFailures) == 1)
 check("an overdelivery still finishes the run", overdelivered.data.phase == "idle")
+check("the return job is handed exactly what the consumer refused",
+    sectorCalls[1].code == Factory.sectorCode.returnGoods
+        and sectorCalls[1].args[4] == "Iron Mine"
+        and sectorCalls[1].args[5] == "Iron"
+        and sectorCalls[1].args[6] == 15)
+
+print("\n[returning undelivered goods]")
+
+-- The return runs in its own sector state, so it is loaded and executed here with only the
+-- engine calls it touches stubbed out. Cargo the producer's bay refuses is destroyed by the
+-- engine and is undetectable afterwards, so the log is the only evidence there is.
+local returnStations = {}
+
+function Sector()
+    return {
+        getEntityByFactionAndName = function(_, factionIndex, name) return returnStations[name] end,
+    }
+end
+
+function TradingGood(name)
+    return {name = name}
+end
+
+function CargoBay(station)
+    return station.bay
+end
+
+local function stationWithBay(name, capacity)
+    local station = {
+        name = name,
+        bay = {
+            stored = 0,
+            getNumCargos = function(self) return self.stored end,
+            addCargo = function(self, _, amount) self.stored = math.min(capacity, self.stored + amount) end,
+        },
+    }
+    returnStations[name] = station
+    return station
+end
+
+assert(loadstring(Factory.sectorCode.returnGoods, "returnCode"))()
+
+local logLines
+local function capturingLog(work)
+    logLines = {}
+    local realPrint = print
+    print = function(line) table.insert(logLines, line) end
+    work()
+    print = realPrint
+end
+
+local function loggedMatch(pattern)
+    for _, line in ipairs(logLines) do
+        if line:find(pattern, 1, true) then return true end
+    end
+    return false
+end
+
+local roomy = stationWithBay("Roomy Mine", 1000)
+capturingLog(function() run(10, "Hauler", 10, "Roomy Mine", "Iron", 15) end)
+check("a producer with room takes the whole remainder back", roomy.bay.stored == 15)
+check("a complete return says nothing", #logLines == 0)
+
+local cramped = stationWithBay("Cramped Mine", 5)
+capturingLog(function() run(10, "Hauler", 10, "Cramped Mine", "Iron", 15) end)
+check("a producer only takes back what fits", cramped.bay.stored == 5)
+check("cargo the producer refuses is reported as lost",
+    #logLines == 1
+        and loggedMatch("'Hauler' lost 10 units of Iron")
+        and loggedMatch("'Cramped Mine' took back only 5 of 15"))
+
+local full = stationWithBay("Full Mine", 0)
+capturingLog(function() run(10, "Hauler", 10, "Full Mine", "Iron", 15) end)
+check("a producer with no room at all loses everything, loudly",
+    full.bay.stored == 0 and loggedMatch("'Hauler' lost 15 units of Iron"))
+
+capturingLog(function() run(10, "Hauler", 10, "Vanished Mine", "Iron", 15) end)
+check("a return to a station that disappeared is reported as lost",
+    loggedMatch("'Hauler' lost 15 units of Iron") and loggedMatch("could not take them back"))
+
+capturingLog(function() run(10, "Hauler", 10, "Roomy Mine", "Unobtainium", 15) end)
+check("a return of an unknown good is reported as lost",
+    loggedMatch("'Hauler' lost 15 units of Unobtainium"))
 
 print("\n[ferry visuals]")
 

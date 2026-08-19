@@ -814,7 +814,11 @@ end
 ]]
 
 -- Whatever the consumer could not take is pushed straight back into the producer's bay, so
--- an overdelivery never destroys goods.
+-- an overdelivery normally destroys nothing. The producer's bay is not guaranteed to still
+-- have the room it had when the goods were taken out of it, though -- it keeps producing,
+-- and other haulers keep dropping off -- so what it really takes back is measured the same
+-- way the pickup and the delivery measure theirs. Anything it refuses is destroyed by the
+-- engine, which is invisible after the fact, so it is logged here and nowhere else.
 local returnCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
@@ -826,12 +830,21 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount)
     local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     local good = goods[goodName]
     if not valid(station) or not good then
-        print(string.format("StockFactory: '%s' could not return %i units of %s to '%s'",
+        print(string.format("StockFactory: '%s' lost %i units of %s - '%s' could not take them back (station gone or unknown cargo type)",
             tostring(shipName), amount, tostring(goodName), tostring(stationName)))
         return
     end
 
-    CargoBay(station):addCargo(tradingGood(good), amount)
+    local cargoBay = CargoBay(station)
+    local exact = tradingGood(good)
+    local before = cargoBay:getNumCargos(exact)
+    cargoBay:addCargo(exact, amount)
+    local returned = cargoBay:getNumCargos(exact) - before
+
+    if returned < amount then
+        print(string.format("StockFactory: '%s' lost %i units of %s - '%s' took back only %i of %i, its bay is full",
+            tostring(shipName), amount - returned, tostring(goodName), tostring(stationName), returned, amount))
+    end
 end
 ]]
 
@@ -2106,4 +2119,8 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
 end
 
 
-return setmetatable({new = new}, {__call = function(_, ...) return new(...) end})
+-- The sector jobs run in throwaway Lua states and are never called directly, so they are
+-- exposed here purely so the tests can load and exercise them.
+local sectorCode = {probe = probeCode, remove = removeCode, add = addCode, returnGoods = returnCode}
+
+return setmetatable({new = new, sectorCode = sectorCode}, {__call = function(_, ...) return new(...) end})
