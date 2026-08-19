@@ -698,13 +698,19 @@ function run(faction, shipName, stationFaction, stationName, script, goodName, c
         return
     end
 
+    -- maxStock is a per-trade-slot quota (TradingManager:getMaxStock divides maxCargoSpace by
+    -- the number of trade slots), not room in the bay: a station whose bay is full of other
+    -- goods still reports a healthy quota. The physical space is reported alongside it so a
+    -- haul can be capped by both. -1 means "unknown" (no cargo bay), i.e. don't cap by space.
+    local freeSpace = station.freeCargoSpace or -1
+
     local callError, stock, maxStock = station:invokeFunction(script, "getStock", goodName)
     if callError ~= 0 then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, 0, 0)
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, 0, 0, freeSpace)
         return
     end
 
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, stock, maxStock)
+    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, stock, maxStock, freeSpace)
 end
 ]]
 
@@ -903,6 +909,7 @@ function StockFactoryCommand:beginTransfer()
         targetReceived = false,
         sourceReceived = false,
         targetRoom = 0,
+        targetFreeSpace = -1,
         sourceStock = 0,
     }
 
@@ -940,10 +947,13 @@ function StockFactoryCommand:acceptStockReport(commandToken, transactionId, good
     return transaction
 end
 
-function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock)
+function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock, freeSpace)
     local transaction = self:acceptStockReport(commandToken, transactionId, good)
     if not transaction then return end
+    -- how much of this good the station still wants...
     transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
+    -- ...and how much its bay can physically hold, which the quota above says nothing about
+    transaction.targetFreeSpace = freeSpace or -1
     transaction.targetReceived = true
 
     self:tryExecuteHaul()
@@ -978,19 +988,28 @@ function StockFactoryCommand:tryExecuteHaul()
         cargoUnits = math.floor(ship:getFreeCargoSpace() / size)
     end
 
-    -- never haul more than the station actually needs (its free room), never more
-    -- than the source has, and never more than the ship could carry in one run
-    local amount = math.min(tr.targetRoom, tr.sourceStock, cargoUnits)
+    -- the target's quota for this good is not room in its bay: a station stuffed with other
+    -- goods still reports a quota, so cap by what the bay can really hold as well
+    -- (vanilla does the same in tradingmanager.lua, TradingManager:sellToStation)
+    local freeSpace = tr.targetFreeSpace or -1
+    local spaceUnits = math.huge
+    if freeSpace >= 0 then spaceUnits = math.floor(freeSpace / size) end
+
+    -- never haul more than the station actually needs (its free room), never more than its
+    -- bay can hold, never more than the source has, and never more than the ship carries
+    local amount = math.min(tr.targetRoom, spaceUnits, tr.sourceStock, cargoUnits)
 
     if not amount or amount <= 0 then
-        -- source has no stock yet, or consumer is already full
-        -- try a new random pair soon instead of cycling deterministically
-        print(string.format("StockFactory: '%s' skipped %s from '%s' to '%s' - target room %i, source stock %i, ship space %i",
+        -- source has no stock yet, or the consumer is already full - either of the good
+        -- itself or of anything else. Try a new random pair soon instead of cycling
+        -- deterministically.
+        print(string.format("StockFactory: '%s' skipped %s from '%s' to '%s' - target room %i, target bay space %s, source stock %i, ship space %i",
             tostring(self.shipName), tostring(good), tostring(haul.source.name), tostring(haul.target.name),
-            tr.targetRoom or 0, tr.sourceStock or 0, cargoUnits))
+            tr.targetRoom or 0, spaceUnits == math.huge and "unknown" or string.format("%i", spaceUnits),
+            tr.sourceStock or 0, cargoUnits))
 
         if (tr.sourceStock or 0) <= 0 then self:noteHaulFailure("source", good, haul.source) end
-        if (tr.targetRoom or 0) <= 0 then self:noteHaulFailure("target", good, haul.target) end
+        if (tr.targetRoom or 0) <= 0 or spaceUnits <= 0 then self:noteHaulFailure("target", good, haul.target) end
 
         self:abandonTransfer(5)
         return
@@ -1042,8 +1061,9 @@ function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good,
     end
 
     if (notAdded or 0) > 0 then
-        -- another hauler took the last of the room in the same few frames; nothing is
-        -- destroyed, the remainder goes straight back to the producer
+        -- the bay took less than we sized the haul for: usually it is physically full of
+        -- other goods, but another hauler can also have taken the last of the room in the
+        -- same few frames. Nothing is destroyed, the remainder goes back to the producer.
         print(string.format("StockFactory: '%s' returned %i units of %s to '%s' - '%s' only took %i",
             tostring(self.shipName), notAdded, tostring(good), tostring(haul.source.name),
             tostring(haul.target.name), added or 0))
