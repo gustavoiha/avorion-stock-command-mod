@@ -21,9 +21,8 @@ local Placer = include ("placer")
 -- then leaves through the gate that points at its next stop.
 --
 -- If the sector has no gate the ferry falls back to jumping in / out on the spot.
--- Docking the delivery station is reported back to the command, which is what makes the
--- goods transfer resolve exactly as the ferry touches the dock. Everything else here is
--- purely visual: the goods themselves are moved by the background command.
+-- All of this is purely visual: the goods themselves are moved by the background command,
+-- which hands them over before the ferry sets off and names the station to dock with.
 --
 -- Modeled on the vanilla data/scripts/entity/ai/trade.lua (dock behaviour) and
 -- data/scripts/entity/ai/passgate.lua (gate approach).
@@ -241,18 +240,6 @@ local function requestReturn(ship)
     end)
 end
 
--- tell the command we are docked; when this is the delivery stop it is what triggers the
--- goods transfer, so the economy message lands together with the visible docking
-local function reportDocked(station)
-    local x, y = Sector():getCoordinates()
-
-    pcall(function()
-        invokeFactionFunction(factionIndex, true,
-            "background/simulation/simulation.lua",
-            "invokeCommandFunction", Entity().name, "onFerryDocked", x, y, station.name)
-    end)
-end
-
 -- lazy wander used while the ferry has time to spare in a sector it isn't docking at
 local function patrolTransit(ship)
     if not transitDestination or distance(ship.translationf, transitDestination) < 500 then
@@ -394,7 +381,6 @@ function updateServer(timeStep)
         if DockAI.flyToDock(ship, station) then
             stage = 1
             waitCount = 0
-            reportDocked(station)
         end
 
     elseif stage == 1 then

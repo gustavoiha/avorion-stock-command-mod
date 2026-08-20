@@ -19,27 +19,20 @@ StockFactoryCommand.type = CommandType.StockFactory
 -- anchor-sector operating radius over the gate network
 local MaxGateJumps = 5
 
--- How long a run takes. Flat rather than distance-based, so a run is a predictable few
--- minutes of work wherever the stations are. Whole minutes only: the background simulation
--- ticks once a minute, so anything else just rounds up to one. A run is a single leg now
--- (the whole transfer resolves at the end of it), so this covers what used to be two.
-local MinTravelMinutes = 4
-local MaxTravelMinutes = 6
+-- How long the ferry spends flying a load out to the consumer. The goods have already
+-- changed hands by the time it sets off; the leg is what stops one hauler from working a
+-- whole region in a single tick. Whole minutes only: the background simulation ticks once a
+-- minute, so anything else just rounds up to one.
+local MinTravelMinutes = 3
+local MaxTravelMinutes = 5
 
--- Tail of a run during which the ferry appearance is placed at the delivery target, so a
--- watching player sees it fly in and dock before the transfer resolves.
+-- Tail of the leg during which the ferry appearance is placed at the consumer, so a watching
+-- player sees it fly in and dock.
 local ApproachSeconds = 120
-
--- How long past the scheduled transfer time the command waits for a watched ferry to finish
--- docking. Nothing is in flight between stations, so overshooting only costs a little time.
-local DockGraceSeconds = 90
 
 -- Upper bound on how long the ferry patrols a transit sector before moving on. It has to
 -- vacate the single appearance slot in time for the delivery approach.
 local MaxTransitLinger = 60
-
--- Chance that a run includes a purely decorative stop at the source station.
-local SourceVisitChance = 0.35
 
 -- safety cap so the gate-jump flood fill can never run away
 local MaxReachableSectors = 400
@@ -47,10 +40,9 @@ local MaxReachableSectors = 400
 -- how often (seconds) the command re-scans reachable suppliers and the gate route
 local RemapInterval = 5 * 60
 local CommandLeaseKey = "stock_factory_command_lease"
-local probeCode
 
--- How long to wait for an asynchronous sector transfer before giving up on the run. Goods
--- only ever live in a station's cargo bay, so an abandoned transfer strands nothing.
+-- How long to wait for an asynchronous sector job before giving up on the run. Goods only
+-- ever live in a station's cargo bay, so an abandoned transfer strands nothing.
 local TransactionTimeout = 300
 
 -- Sector loading is asynchronous and querySectors polls once per command update, i.e. once
@@ -59,68 +51,76 @@ local TransactionTimeout = 300
 -- observed loaded and the haul retries until it is abandoned.
 local SectorKeepSeconds = 90
 
--- window in which every command that remaps in the same simulation tick shares one
--- empire-wide station scan
-local StationTradeCacheSeconds = 10
+-- Window in which every command planning in the same simulation tick shares one empire-wide
+-- station scan. It is measured against real server runtime, but a tick is
+-- Simulation.getUpdateInterval() real seconds -- 60/SpeedUp -- so a fixed number of seconds
+-- would let the scan survive from one tick into the next on a sped-up galaxy. Expressed as a
+-- fraction of the tick instead, it stays shared within one pass over the command list and
+-- never across two, whatever speed the galaxy runs at.
+local StationTradeCacheTickFraction = 1 / 6
+
+-- used only if the simulation cannot be asked; matches its own SpeedUp = 1 interval
+local DefaultTickSeconds = 60
 
 -- a committing transfer only blocks recall for this long, so a lost sector reply can
 -- never strand the ship (Simulation.forceRecall silently aborts on a recall error)
 local RecallBlockSeconds = 30
 
--- A source that turned out empty, or a target that turned out full, is remembered for a
--- while: rediscovering it costs a full travel leg plus two sector loads every time.
-local RecentFailureSeconds = 10 * 60
-local MaxRecentFailures = 64
-local MaxPlanAttempts = 12
-local BlockedPlanRetrySeconds = 60
+-- A haul is sized from station data that can be a few seconds old, so a transfer can still
+-- come up short. Nothing travelled to find that out, so the ship just picks another pair. The
+-- background simulation ticks once a minute, so in practice this means "on the next tick".
+local FailedHaulRetrySeconds = 15
+
+-- How long a hauler waits before looking again once its region has nothing worth moving.
+local DryRegionRetrySeconds = 120
+
+-- How this one ship ranks the loads it could move. One setting per command, chosen by the
+-- player when the ship is assigned. Numbers, so the command framework can clamp the value for
+-- us (see getConfigurableValues).
+--
+-- Every hauler plans from the same station data, so a fleet that all share one setting will
+-- all reach for the same pair. That is the player's dial, not ours: giving haulers different
+-- settings is what spreads a fleet across the region, and the default asks for nothing in
+-- particular so an unconfigured fleet spreads out on its own.
+local HaulPriority = {
+    Random        = 1,
+    HighestValue  = 2,
+    HighestVolume = 3,
+    LowestValue   = 4,
+    LowestVolume  = 5,
+}
+
+-- Dropdown labels, in the order the dropdown lists them.
+local HaulPriorityNames = {
+    [1] = "No preference"%_t,
+    [2] = "Highest total value"%_t,
+    [3] = "Highest total volume"%_t,
+    [4] = "Lowest total value"%_t,
+    [5] = "Lowest total volume"%_t,
+}
 
 
 ---------------------------------------------------------------------
 -- small helpers
 ---------------------------------------------------------------------
 
--- a good may only be ferried if it exists and isn't stolen or illegal
+-- A good may only be ferried if it exists, isn't stolen or illegal, and takes up space --
+-- every haul is sized by dividing cargo room by the good's size, so a zero is not a good.
 local function isGoodEligible(name)
     local good = goods[name]
     if not good then return false end
     if good.stolen or good.illegal then return false end
-    return true
-end
-
-local function isGoodIgnored(config, name)
-    return config and type(config.ignoredGoods) == "table" and config.ignoredGoods[name] == true
+    return (good.size or 0) > 0
 end
 
 local function skey(x, y)
     return x .. ":" .. y
 end
 
-local function stationSuffix(station)
-    return tostring(station.factionIndex) .. "|" .. station.name .. "@" .. skey(station.x, station.y)
-end
-
-local function failureKey(kind, good, station)
-    return kind .. "|" .. good .. "|" .. stationSuffix(station)
-end
-
--- all eligible goods present across any station in the list (union of buys and sells)
-local function allStationGoods(stations)
-    local result = {}
-    for _, st in pairs(stations or {}) do
-        for good, _ in pairs(st.buys or {}) do
-            if not result[good] and isGoodEligible(good) then result[good] = true end
-        end
-        for good, _ in pairs(st.sells or {}) do
-            if not result[good] and isGoodEligible(good) then result[good] = true end
-        end
-    end
-    return result
-end
-
 -- One pass over the stations yields, per good, the stations that can receive it and the
 -- stations that can supply it. A target has to buy the good and a source must not, so the
 -- two lists are always disjoint.
-local function buildRouteIndex(stations, config)
+local function buildRouteIndex(stations)
     local index = {}
 
     local function entryFor(good)
@@ -135,7 +135,7 @@ local function buildRouteIndex(stations, config)
     for _, st in pairs(stations or {}) do
         if st.stockHaulerDeliveryEnabled ~= false then
             for good, _ in pairs(st.buys or {}) do
-                if isGoodEligible(good) and not isGoodIgnored(config, good) then
+                if isGoodEligible(good) then
                     table.insert(entryFor(good).targets, st)
                 end
             end
@@ -143,8 +143,7 @@ local function buildRouteIndex(stations, config)
 
         if st.stockHaulerPickupEnabled ~= false then
             for good, _ in pairs(st.sells or {}) do
-                if isGoodEligible(good) and not isGoodIgnored(config, good)
-                    and not (st.buys and st.buys[good]) then
+                if isGoodEligible(good) and not (st.buys and st.buys[good]) then
                     table.insert(entryFor(good).sources, st)
                 end
             end
@@ -152,6 +151,117 @@ local function buildRouteIndex(stations, config)
     end
 
     return index
+end
+
+
+---------------------------------------------------------------------
+-- haul candidates
+---------------------------------------------------------------------
+--
+-- Everything a haul needs in order to be sized already lives in the station database
+-- entries, which read without loading a single sector. That is what lets a hauler cost every
+-- producer/consumer pair in its region before it commits to one, instead of guessing a pair
+-- and spending a travel leg discovering the producer was empty.
+
+-- units of `good` in the station's bay. Cargo is keyed by exact trading good, so the stolen
+-- and illegal variants of a good are deliberately not counted towards the clean one.
+local function stationStock(station, good)
+    return (station.stock or {})[good] or 0
+end
+
+-- Mirrors TradingManager:getMaxStock. A station's quota for one good is its whole bay split
+-- across its trade slots, so it says nothing about the space actually left in that bay.
+local function stationQuota(station, size)
+    local space = station.baySize or 0
+    local slots = station.tradeSlots or 0
+    if slots > 0 then space = space / slots end
+
+    if space / size > 100 then
+        return math.min(50000, math.floor(space / size / 100 + 0.5) * 100)
+    end
+
+    return math.floor(space / size)
+end
+
+-- how many units the consumer can still take: capped by its quota for the good and by the
+-- room physically left in its bay, which the quota says nothing about
+local function stationRoom(station, good, size)
+    local room = stationQuota(station, size) - stationStock(station, good)
+
+    local free = station.freeSpace or -1
+    if free >= 0 then room = math.min(room, math.floor(free / size)) end
+
+    return math.max(0, room)
+end
+
+-- Every producer/consumer pair that would move something right now, sized the way the
+-- transfer will size it. A pair that would move nothing is simply absent, which is why the
+-- command needs no memory of what came up empty last time.
+local function collectCandidates(stations, shipSpace)
+    local candidates = {}
+
+    for good, entry in pairs(buildRouteIndex(stations)) do
+        local size = goods[good].size
+        local shipUnits = math.floor(shipSpace / size)
+
+        for _, source in pairs(entry.sources) do
+            local available = math.min(stationStock(source, good), shipUnits)
+
+            for _, target in pairs(entry.targets) do
+                local amount = math.min(available, stationRoom(target, good, size))
+                if amount > 0 then
+                    table.insert(candidates, {good = good, source = source, target = target, amount = amount})
+                end
+            end
+        end
+    end
+
+    return candidates
+end
+
+-- What this ship was told to reach for first. Cheapest and smallest are the same rankings
+-- negated, so one score covers all four ordered modes; Random scores nothing and is drawn
+-- flat instead, which is the only way every pair gets the same chance.
+local function haulScore(candidate, priority)
+    local good = goods[candidate.good]
+
+    if priority == HaulPriority.HighestValue  then return  candidate.amount * good.price end
+    if priority == HaulPriority.LowestValue   then return -candidate.amount * good.price end
+    if priority == HaulPriority.HighestVolume then return  candidate.amount * good.size end
+    if priority == HaulPriority.LowestVolume  then return -candidate.amount * good.size end
+
+    return 0
+end
+
+-- The best-scoring load, with exact ties broken at random rather than by table order.
+--
+-- Ties are common and they matter: the hauler's own hold is usually the binding cap, so every
+-- route carrying the same good scores identically. Every hauler in a fleet plans from the
+-- same snapshot in the same tick, so settling ties by iteration order would hand all of them
+-- the same route. Drawing from the tied set instead spreads them over routes the player's own
+-- criterion calls equally good -- a lower-scoring load is still never chosen.
+local function pickHaul(candidates, priority)
+    if #candidates == 0 then return nil end
+
+    if priority == HaulPriority.Random then
+        return candidates[random():getInt(1, #candidates)]
+    end
+
+    local best, bestScore, tied = candidates[1], haulScore(candidates[1], priority), 1
+
+    for i = 2, #candidates do
+        local score = haulScore(candidates[i], priority)
+
+        if score > bestScore then
+            best, bestScore, tied = candidates[i], score, 1
+        elseif score == bestScore then
+            -- reservoir sample, so each of the tied routes is equally likely
+            tied = tied + 1
+            if random():getInt(1, tied) == 1 then best = candidates[i] end
+        end
+    end
+
+    return best
 end
 
 local function goodDisplayName(name, amount)
@@ -185,7 +295,7 @@ end
 -- it must be possible to call the command without any parameters to access some functionality
 local function new(ship, area, config)
     config = config or {}
-    if type(config.ignoredGoods) ~= "table" then config.ignoredGoods = {} end
+    config.priority = tonumber(config.priority) or HaulPriority.Random
 
     local command = setmetatable({
         type = CommandType.StockFactory,
@@ -237,7 +347,7 @@ function StockFactoryCommand:onStart()
     self.data.gateCameFrom = analysis.gateCameFrom or {}
     self.data.callingPlayer = analysis.callingPlayer
     self.config = self.config or {}
-    self.config.ignoredGoods = self.config.ignoredGoods or {}
+    self.config.priority = tonumber(self.config.priority) or HaulPriority.Random
 
     self.data.phase = "idle"
     self.data.timer = 0
@@ -304,52 +414,38 @@ function StockFactoryCommand:update(timeStep)
         end
     end
 
-    self.data.clock = (self.data.clock or 0) + timeStep
     self.data.timer = (self.data.timer or 0) + timeStep
 
-    local phase = self.data.phase or "idle"
+    if self.data.phase == "travelling" then
+        local haul = self.data.currentHaul
+        if haul and self.data.timer < (haul.travelTime or 0) then return end
 
-    if phase == "idle" then
-        if (self.data.rescanCooldown or 0) > 0 then
-            self.data.rescanCooldown = self.data.rescanCooldown - timeStep
-            return
-        end
+        -- the load changed hands before the leg even started, so arriving just frees the ship
+        self.data.currentHaul = nil
+        self.data.phase = "idle"
+        self.data.timer = 0
+    end
+
+    if self.data.phase == "idle" then
+        -- decremented before it is tested, so a cooldown shorter than one tick costs exactly
+        -- one tick rather than two
+        self.data.rescanCooldown = (self.data.rescanCooldown or 0) - timeStep
+        if self.data.rescanCooldown > 0 then return end
+
         self:planNextHaul()
 
-    elseif phase == "travelling" then
-        local haul = self.data.currentHaul
-        if not haul then
-            self.data.phase = "idle"
-            return
-        end
-
-        local legTime = haul.travelTime or 60
-
-        if self.data.timer >= legTime + DockGraceSeconds then
-            -- the ferry never reported a dock (nobody watching, docks full, player left)
-            self:beginTransfer()
-        elseif self.data.timer >= legTime then
-            if self:ferryIsApproachingTarget() then
-                -- hold the transfer so the message lands as the ferry touches the dock
-                self:querySectors(true, true)
-            else
-                self:beginTransfer()
-            end
-        elseif self.data.timer + timeStep >= legTime then
-            -- sector loading is async, so start it a tick early and arrive to a ready sector
-            self:querySectors(true, true)
-        end
-
-    elseif phase == "transferring" then
-        -- waiting for the asynchronous sector probes / transfers to report back. Goods only
-        -- ever exist inside a station's cargo bay, so abandoning the run strands nothing.
+    elseif self.data.phase == "transferring" then
+        -- waiting on the asynchronous sector jobs. One timeout covers both stalls there are:
+        -- a sector that never loads, and a job whose reply never arrives.
         if self.data.timer >= TransactionTimeout then
             local tr = self.data.transaction or {}
-            print(string.format("StockFactory: '%s' transfer timeout - transaction #%s stage '%s', good '%s', target reply %s, source reply %s",
-                tostring(self.shipName), tostring(tr.id), tostring(tr.stage), tostring(tr.good),
-                tostring(tr.targetReceived), tostring(tr.sourceReceived)))
+            print(string.format("StockFactory: '%s' transfer timeout - transaction #%s stage '%s', good '%s'",
+                tostring(self.shipName), tostring(tr.id), tostring(tr.stage), tostring(tr.good)))
 
-            self:abandonTransfer(60)
+            self:abandonTransfer(FailedHaulRetrySeconds)
+        elseif not self.data.transaction then
+            -- both sectors have to be in memory before anything can move; keep asking
+            self:beginTransfer()
         end
     end
 end
@@ -360,7 +456,6 @@ end
 function StockFactoryCommand:abandonTransfer(cooldown)
     self.data.transaction = nil
     self.data.currentHaul = nil
-    self.data.probeRetries = 0
     self.data.phase = "idle"
     self.data.timer = 0
     self.data.rescanCooldown = cooldown or 0
@@ -383,7 +478,7 @@ end
 
 function StockFactoryCommand:onRestore()
     self.config = self.config or {}
-    if type(self.config.ignoredGoods) ~= "table" then self.config.ignoredGoods = {} end
+    self.config.priority = tonumber(self.config.priority) or HaulPriority.Random
     self.data.nextTransactionId = self.data.nextTransactionId or 0
 
     if self.data.transferProtocolVersion == 3 and self.data.commandToken then
@@ -426,207 +521,80 @@ end
 -- ferry planning
 ---------------------------------------------------------------------
 
--- stations in the anchor region that consume the good and allow stock-hauler delivery
-function StockFactoryCommand:eligibleTargets(good)
-    local result = {}
-
-    if isGoodIgnored(self.config, good) then return result end
-
-    for _, st in pairs(self.data.stations or {}) do
-        if st.buys and st.buys[good]
-            and st.stockHaulerDeliveryEnabled ~= false then
-            table.insert(result, st)
-        end
-    end
-
-    return result
-end
-
--- stations in the anchor region that can supply the good for a target:
---  - different station than the consumer
---  - sell the good
---  - do not also buy the same good (prevents internal starvation/loops)
---  - not opted out of stock-hauler pickup
-function StockFactoryCommand:eligibleSources(good, target)
-    local result = {}
-
-    if isGoodIgnored(self.config, good) then return result end
-
-    for _, st in pairs(self.data.stations or {}) do
-        if not (st.name == target.name and st.factionIndex == target.factionIndex)
-            and st.sells and st.sells[good]
-            and not (st.buys and st.buys[good])
-            and st.stockHaulerPickupEnabled ~= false then
-            table.insert(result, st)
-        end
-    end
-
-    return result
-end
-
--- travel time for one run of the haul
+-- travel time for one leg of a run
 function StockFactoryCommand:estimateTravelTime()
     return random():getInt(MinTravelMinutes, MaxTravelMinutes) * 60
 end
 
--- Remembers that a station was useless for a good, so the next plan can skip it. `kind` is
--- "source" (had no stock) or "target" (had no room).
-function StockFactoryCommand:noteHaulFailure(kind, good, station)
-    if not good or not station or not station.name then return end
-
-    local failures = self.data.recentFailures
-    if not failures then
-        failures = {}
-        self.data.recentFailures = failures
-    end
-
-    failures[failureKey(kind, good, station)] = (self.data.clock or 0) + RecentFailureSeconds
-end
-
--- A station we just delivered inputs to can start producing again, so it stops counting as
--- a known-dry source without waiting out the timer.
-function StockFactoryCommand:clearSourceFailures(station)
-    local failures = self.data.recentFailures
-    if not failures or not station or not station.name then return end
-
-    local suffix = "|" .. stationSuffix(station)
-    for key in pairs(failures) do
-        if key:sub(1, 7) == "source|" and key:sub(-#suffix) == suffix then
-            failures[key] = nil
-        end
-    end
-end
-
--- Drops expired entries and returns what is left, or nil when there is nothing to avoid.
--- The whole table is discarded if it ever grows past the cap: every entry is only a hint,
--- and it is persisted with the command.
-function StockFactoryCommand:pruneHaulFailures()
-    local failures = self.data.recentFailures
-    if not failures then return nil end
-
-    local now = self.data.clock or 0
-    local remaining = 0
-
-    for key, expiry in pairs(failures) do
-        if expiry <= now then
-            failures[key] = nil
-        else
-            remaining = remaining + 1
-        end
-    end
-
-    if remaining == 0 or remaining > MaxRecentFailures then
-        self.data.recentFailures = nil
-        return nil
-    end
-
-    return failures
-end
-
--- One uniformly random (good, source, target) triple. Sources and targets are disjoint per
--- good, so a good contributes exactly #targets * #sources pairs and the triple can be
--- addressed by index instead of materialising every combination.
-local function pickHaulTriple(index, total)
-    local pick = random():getInt(1, total)
-
-    for good, entry in pairs(index) do
-        local pairsForGood = #entry.targets * #entry.sources
-        if pick <= pairsForGood then
-            return good,
-                entry.sources[(pick - 1) % #entry.sources + 1],
-                entry.targets[math.floor((pick - 1) / #entry.sources) + 1]
-        end
-        pick = pick - pairsForGood
-    end
-end
-
+-- Costs every pair the region can offer and commits to one of the best. The transfer starts
+-- straight away: a pair that turns out to be worth nothing costs seconds, not a travel leg,
+-- which is why nothing about it needs remembering.
 function StockFactoryCommand:planNextHaul()
-    local index = buildRouteIndex(self.data.stations, self.config)
+    local owner = getParentFaction()
+    if not owner then return end
 
-    local total = 0
-    for _, entry in pairs(index) do
-        total = total + #entry.targets * #entry.sources
-    end
+    -- station stock is what a plan is made of, so it is re-read here rather than left to the
+    -- much slower route re-map. The scan is shared by every command running in the same tick.
+    self:refreshStations()
 
-    if total > 0 then
-        local failures = self:pruneHaulFailures()
-        local good, source, target
+    local ship = ShipDatabaseEntry(owner.index, self.shipName)
+    local shipSpace = valid(ship) and ship:getFreeCargoSpace() or 0
 
-        -- Rejection sampling: recently failed stations are a small slice of the space, so
-        -- redrawing is cheaper than counting the viable pairs on every plan.
-        for _ = 1, MaxPlanAttempts do
-            good, source, target = pickHaulTriple(index, total)
-            if not good then break end
+    local haul = pickHaul(collectCandidates(self.data.stations, shipSpace), self.config.priority)
 
-            if not failures
-                or not (failures[failureKey("source", good, source)]
-                    or failures[failureKey("target", good, target)]) then
-                break
-            end
-
-            good = nil
-        end
-
-        if not good then
-            -- everything drawn was a station we just found empty or full; waiting beats
-            -- spending another travel leg confirming it
-            self.data.phase = "idle"
-            self.data.rescanCooldown = BlockedPlanRetrySeconds
-            return
-        end
-
-        local travelTime = self:estimateTravelTime()
-
-        self.data.currentHaul = {
-            good = good,
-            source = {
-                name = source.name,
-                factionIndex = source.factionIndex,
-                x = source.x,
-                y = source.y,
-                script = source.sells[good],
-            },
-            target = {
-                name = target.name,
-                factionIndex = target.factionIndex,
-                x = target.x,
-                y = target.y,
-                script = target.buys[good],
-            },
-            travelTime = travelTime,
-            -- purely decorative: makes the ferry stop off at the producer on the way
-            visitSource = random():test(SourceVisitChance),
-        }
-
-        self.data.phase = "travelling"
-        self.data.timer = 0
-        self.data.reportedNoRoutes = nil
+    if not haul then
+        -- nothing worth moving right now: stay assigned, idle near the anchor, look again later
+        self.data.phase = "idle"
+        self.data.rescanCooldown = DryRegionRetrySeconds
+        self:reportNoRoutes()
         return
     end
 
-    -- nothing to fetch right now: stay assigned, idle near the station, re-scan later
-    self.data.phase = "idle"
-    self.data.rescanCooldown = 120
-    self:reportNoRoutes(index)
+    self.data.currentHaul = {
+        good = haul.good,
+        amount = haul.amount,
+        source = {
+            name = haul.source.name,
+            factionIndex = haul.source.factionIndex,
+            x = haul.source.x,
+            y = haul.source.y,
+            script = haul.source.sells[haul.good],
+        },
+        target = {
+            name = haul.target.name,
+            factionIndex = haul.target.factionIndex,
+            x = haul.target.x,
+            y = haul.target.y,
+            script = haul.target.buys[haul.good],
+        },
+    }
+
+    self.data.reportedNoRoutes = nil
+    self.data.phase = "transferring"
+    self.data.timer = 0
+    self:beginTransfer()
 end
 
 -- Explains once (per dry spell) why the hauler is sitting still, so "nothing happens" is
 -- never silent. Reset as soon as a haul is planned.
-function StockFactoryCommand:reportNoRoutes(index)
+function StockFactoryCommand:reportNoRoutes()
     if self.data.reportedNoRoutes then return end
     self.data.reportedNoRoutes = true
 
     local numStations = 0
     for _ in pairs(self.data.stations or {}) do numStations = numStations + 1 end
 
-    local numConsumers, numProducers = 0, 0
-    for _, entry in pairs(index) do
-        if #entry.targets > 0 then numConsumers = numConsumers + 1 end
-        if #entry.sources > 0 then numProducers = numProducers + 1 end
+    local numConsumers, numPaired = 0, 0
+    for _, entry in pairs(buildRouteIndex(self.data.stations)) do
+        if #entry.targets > 0 then
+            numConsumers = numConsumers + 1
+            -- sources and targets are disjoint per good, so any of each is already a pair
+            if #entry.sources > 0 then numPaired = numPaired + 1 end
+        end
     end
 
-    print(string.format("StockFactory: '%s' idle - %i reachable owned trading stations, %i goods with a consumer, %i goods with a producer",
-        tostring(self.shipName), numStations, numConsumers, numProducers))
+    print(string.format("StockFactory: '%s' idle - %i reachable owned trading stations, %i goods with a consumer, %i of those with a producer",
+        tostring(self.shipName), numStations, numConsumers, numPaired))
 
     local owner = getParentFaction()
     if not owner then return end
@@ -635,8 +603,10 @@ function StockFactoryCommand:reportNoRoutes(index)
         owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, I can't reach any of our trading stations from the anchor sector. Waiting here."%_T)
     elseif numConsumers == 0 then
         owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, none of the %1% stations I can reach buys anything I'm allowed to haul. Waiting here."%_T, numStations)
-    else
+    elseif numPaired == 0 then
         owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, I can reach %1% stations but found no producer for what they need. Waiting here."%_T, numStations)
+    else
+        owner:sendChatMessage(self.shipName, ChatMessageType.Information, "Commander, our %1% stations in range have nothing to spare for each other right now. Waiting here."%_T, numStations)
     end
 end
 
@@ -665,52 +635,6 @@ local function tradingGood(descriptor)
     good.dangerous = descriptor.dangerous or false
     good.tags = descriptor.tags or {}
     return good
-end
-]]
-
-probeCode = [[
-package.path = package.path .. ";data/scripts/lib/?.lua"
-include("utility")
-include("stringutility")
-local StockFactoryUtility = include("stockfactoryutility")
-
-function run(faction, shipName, stationFaction, stationName, script, goodName, callback, commandToken, transactionId, callingPlayer)
-    local ship = ShipDatabaseEntry(faction, shipName)
-    if not valid(ship) then
-        print(string.format("StockFactory: probe for '%s' aborted - no ship database entry", tostring(shipName)))
-        return
-    end
-    if not StockFactoryUtility.hasCommandLease(ship, commandToken) then
-        print(string.format("StockFactory: probe for '%s' aborted - lease mismatch (entry '%s', command '%s')",
-            tostring(shipName), tostring(ship:getScriptValue("stock_factory_command_lease")), tostring(commandToken)))
-        return
-    end
-
-    local owner = Galaxy():findFaction(faction)
-    if not StockFactoryUtility.canUseStation(owner, stationFaction, callingPlayer) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, I no longer have permission to manage station '%s'."%_T, stationName)
-        return
-    end
-
-    local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
-    if not valid(station) then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "transactionError", commandToken, transactionId, "Commander, station '%s' has disappeared!"%_T, stationName)
-        return
-    end
-
-    -- maxStock is a per-trade-slot quota (TradingManager:getMaxStock divides maxCargoSpace by
-    -- the number of trade slots), not room in the bay: a station whose bay is full of other
-    -- goods still reports a healthy quota. The physical space is reported alongside it so a
-    -- haul can be capped by both. -1 means "unknown" (no cargo bay), i.e. don't cap by space.
-    local freeSpace = station.freeCargoSpace or -1
-
-    local callError, stock, maxStock = station:invokeFunction(script, "getStock", goodName)
-    if callError ~= 0 then
-        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, 0, 0, freeSpace)
-        return
-    end
-
-    invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, callback, commandToken, transactionId, goodName, stock, maxStock, freeSpace)
 end
 ]]
 
@@ -801,8 +725,8 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount, c
         return
     end
 
-    -- another hauler can fill the last of the room between our probe and this frame, so
-    -- only what the bay really took counts as delivered
+    -- the bay can fill up between the plan and this frame, so only what it really took
+    -- counts as delivered
     local cargoBay = CargoBay(station)
     local exact = tradingGood(good)
     local before = cargoBay:getNumCargos(exact)
@@ -814,11 +738,11 @@ end
 ]]
 
 -- Whatever the consumer could not take is pushed straight back into the producer's bay, so
--- an overdelivery normally destroys nothing. The producer's bay is not guaranteed to still
--- have the room it had when the goods were taken out of it, though -- it keeps producing,
--- and other haulers keep dropping off -- so what it really takes back is measured the same
--- way the pickup and the delivery measure theirs. Anything it refuses is destroyed by the
--- engine, which is invisible after the fact, so it is logged here and nowhere else.
+-- a short delivery normally moves nothing anywhere. The producer's bay is not guaranteed to
+-- still have the room it had when the goods left it, though -- it keeps producing, and other
+-- haulers keep dropping off -- so what it really takes back is measured the same way the
+-- pickup and the delivery measure theirs. Anything it refuses is reported back so the
+-- command can stow it on the ship rather than let the engine destroy it.
 local returnCode = [[
 package.path = package.path .. ";data/scripts/lib/?.lua"
 include("utility")
@@ -826,12 +750,17 @@ include("stringutility")
 local StockFactoryUtility = include("stockfactoryutility")
 ]] .. goodsHelperCode .. [[
 
-function run(faction, shipName, stationFaction, stationName, goodName, amount)
+function run(faction, shipName, stationFaction, stationName, goodName, amount, commandToken, transactionId)
+    local function reply(returned)
+        invokeFactionFunction(faction, true, "background/simulation/simulation.lua", "invokeCommandFunction", shipName, "onGoodsReturned", commandToken, transactionId, goodName, returned, amount - returned)
+    end
+
     local station = Sector():getEntityByFactionAndName(stationFaction, stationName)
     local good = goods[goodName]
     if not valid(station) or not good then
-        print(string.format("StockFactory: '%s' lost %i units of %s - '%s' could not take them back (station gone or unknown cargo type)",
+        print(string.format("StockFactory: '%s' could not give %i units of %s back to '%s' - station gone or unknown cargo type",
             tostring(shipName), amount, tostring(goodName), tostring(stationName)))
+        reply(0)
         return
     end
 
@@ -842,33 +771,26 @@ function run(faction, shipName, stationFaction, stationName, goodName, amount)
     local returned = cargoBay:getNumCargos(exact) - before
 
     if returned < amount then
-        print(string.format("StockFactory: '%s' lost %i units of %s - '%s' took back only %i of %i, its bay is full",
+        print(string.format("StockFactory: '%s' could not give %i units of %s back to '%s' - it took only %i of %i, its bay is full",
             tostring(shipName), amount - returned, tostring(goodName), tostring(stationName), returned, amount))
     end
+
+    reply(returned)
 end
 ]]
 
-function StockFactoryCommand:querySectors(needSource, needTarget)
+-- true once both ends of the run are in memory. Loading is asynchronous, so this is asked
+-- again every tick until it answers yes or the run times out.
+function StockFactoryCommand:querySectors()
     local haul = self.data.currentHaul
     local t = haul and haul.target
     local s = haul and haul.source
     if not t or not s then return false end
 
-    if needTarget then
-        Galaxy():keepOrGetSector(t.x, t.y, SectorKeepSeconds)
-    end
-    if needSource then
-        Galaxy():keepOrGetSector(s.x, s.y, SectorKeepSeconds)
-    end
+    Galaxy():keepOrGetSector(t.x, t.y, SectorKeepSeconds)
+    Galaxy():keepOrGetSector(s.x, s.y, SectorKeepSeconds)
 
-    if needTarget and not Galaxy():sectorLoaded(t.x, t.y) then
-        return false
-    end
-    if needSource and not Galaxy():sectorLoaded(s.x, s.y) then
-        return false
-    end
-
-    return true
+    return Galaxy():sectorLoaded(t.x, t.y) and Galaxy():sectorLoaded(s.x, s.y)
 end
 
 function StockFactoryCommand:beginTransfer()
@@ -896,154 +818,60 @@ function StockFactoryCommand:beginTransfer()
             tostring(self.shipName), tostring(haul.good),
             tostring(s.name), tostring(s.script), tostring(t.name), tostring(t.script)))
 
-        self:abandonTransfer(30)
+        self:abandonTransfer(FailedHaulRetrySeconds)
         return
     end
 
-    if not self:querySectors(true, true) then
-        -- sectors not loaded yet: keep trying for a while, then give up this run
-        self.data.probeRetries = (self.data.probeRetries or 0) + 1
-        if self.data.probeRetries > 15 then
-            print(string.format("StockFactory: '%s' gave up loading %i:%i / %i:%i for a %s transfer",
-                tostring(self.shipName), s.x, s.y, t.x, t.y, tostring(haul.good)))
-
-            self:abandonTransfer(60)
-        end
-        return
-    end
-    self.data.probeRetries = 0
+    if not self:querySectors() then return end
 
     self.data.nextTransactionId = (self.data.nextTransactionId or 0) + 1
-    local transactionId = self.data.nextTransactionId
     self.data.transaction = {
-        id = transactionId,
-        stage = "probing",
+        id = self.data.nextTransactionId,
+        stage = "removing",
         good = haul.good,
-        targetReceived = false,
-        sourceReceived = false,
-        targetRoom = 0,
-        targetFreeSpace = -1,
-        sourceStock = 0,
+        delivered = 0,
     }
 
-    runSectorCode(t.x, t.y, true, probeCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, t.script, haul.good, "reportTargetStock", self.data.commandToken, transactionId, self.data.callingPlayer)
-    runSectorCode(s.x, s.y, true, probeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, s.script, haul.good, "reportSourceStock", self.data.commandToken, transactionId, self.data.callingPlayer)
+    runSectorCode(s.x, s.y, true, removeCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, haul.good, haul.amount, self.data.commandToken, self.data.transaction.id, self.data.callingPlayer)
 
-    print(string.format("StockFactory: '%s' probing #%i for %s - source '%s' (%i:%i, %s), target '%s' (%i:%i, %s)",
-        tostring(self.shipName), transactionId, tostring(haul.good),
-        tostring(s.name), s.x, s.y, tostring(s.script),
-        tostring(t.name), t.x, t.y, tostring(t.script)))
-
-    self.data.phase = "transferring"
-    self.data.timer = 0
+    print(string.format("StockFactory: '%s' moving #%i - %i units of %s from '%s' (%i:%i) to '%s' (%i:%i)",
+        tostring(self.shipName), self.data.transaction.id, haul.amount, tostring(haul.good),
+        tostring(s.name), s.x, s.y, tostring(t.name), t.x, t.y))
 end
 
 -- Replies arrive from a queued sector job, so they can be stale. Anything that doesn't match
 -- the in-flight transaction is dropped -- and logged, because a dropped reply is invisible
 -- otherwise and shows up much later as a transfer timeout.
-function StockFactoryCommand:acceptStockReport(commandToken, transactionId, good)
+function StockFactoryCommand:acceptReply(commandToken, transactionId, good, stage)
     local transaction = self.data.transaction
     local reason
 
     if self.data.commandToken ~= commandToken then reason = "lease token changed"
     elseif not transaction then reason = "no transaction in flight"
+    elseif not self.data.currentHaul then reason = "no haul in flight"
     elseif transaction.id ~= transactionId then reason = string.format("transaction %i, expected %i", transactionId or -1, transaction.id or -1)
     elseif transaction.good ~= good then reason = string.format("good '%s', expected '%s'", tostring(good), tostring(transaction.good))
-    elseif transaction.stage ~= "probing" then reason = string.format("stage '%s', expected 'probing'", tostring(transaction.stage))
+    elseif transaction.stage ~= stage then reason = string.format("stage '%s', expected '%s'", tostring(transaction.stage), tostring(stage))
     end
 
     if reason then
-        print(string.format("StockFactory: '%s' dropped a stock report - %s", tostring(self.shipName), reason))
+        print(string.format("StockFactory: '%s' dropped a transfer reply - %s", tostring(self.shipName), reason))
         return nil
     end
 
     return transaction
 end
 
-function StockFactoryCommand:reportTargetStock(commandToken, transactionId, good, stock, maxStock, freeSpace)
-    local transaction = self:acceptStockReport(commandToken, transactionId, good)
-    if not transaction then return end
-    -- how much of this good the station still wants...
-    transaction.targetRoom = math.max(0, (maxStock or 0) - (stock or 0))
-    -- ...and how much its bay can physically hold, which the quota above says nothing about
-    transaction.targetFreeSpace = freeSpace or -1
-    transaction.targetReceived = true
-
-    self:tryExecuteHaul()
-end
-
-function StockFactoryCommand:reportSourceStock(commandToken, transactionId, good, stock, maxStock)
-    local transaction = self:acceptStockReport(commandToken, transactionId, good)
-    if not transaction then return end
-    transaction.sourceStock = stock or 0
-    transaction.sourceReceived = true
-
-    self:tryExecuteHaul()
-end
-
-function StockFactoryCommand:tryExecuteHaul()
-    local tr = self.data.transaction
-    if not tr or not tr.targetReceived or not tr.sourceReceived then return end
-
-    local owner = getParentFaction()
-    local haul = self.data.currentHaul
-    if not haul then
-        self.data.transaction = nil
-        return
-    end
-
-    local good = tr.good
-    local size = goods[good] and goods[good].size or 1
-
-    local ship = ShipDatabaseEntry(owner.index, self.shipName)
-    local cargoUnits = 0
-    if valid(ship) then
-        cargoUnits = math.floor(ship:getFreeCargoSpace() / size)
-    end
-
-    -- the target's quota for this good is not room in its bay: a station stuffed with other
-    -- goods still reports a quota, so cap by what the bay can really hold as well
-    -- (vanilla does the same in tradingmanager.lua, TradingManager:sellToStation)
-    local freeSpace = tr.targetFreeSpace or -1
-    local spaceUnits = math.huge
-    if freeSpace >= 0 then spaceUnits = math.floor(freeSpace / size) end
-
-    -- never haul more than the station actually needs (its free room), never more than its
-    -- bay can hold, never more than the source has, and never more than the ship carries
-    local amount = math.min(tr.targetRoom, spaceUnits, tr.sourceStock, cargoUnits)
-
-    if not amount or amount <= 0 then
-        -- source has no stock yet, or the consumer is already full - either of the good
-        -- itself or of anything else. Try a new random pair soon instead of cycling
-        -- deterministically.
-        print(string.format("StockFactory: '%s' skipped %s from '%s' to '%s' - target room %i, target bay space %s, source stock %i, ship space %i",
-            tostring(self.shipName), tostring(good), tostring(haul.source.name), tostring(haul.target.name),
-            tr.targetRoom or 0, spaceUnits == math.huge and "unknown" or string.format("%i", spaceUnits),
-            tr.sourceStock or 0, cargoUnits))
-
-        if (tr.sourceStock or 0) <= 0 then self:noteHaulFailure("source", good, haul.source) end
-        if (tr.targetRoom or 0) <= 0 or spaceUnits <= 0 then self:noteHaulFailure("target", good, haul.target) end
-
-        self:abandonTransfer(5)
-        return
-    end
-
-    tr.stage = "removing"
-    tr.amount = amount
-    runSectorCode(haul.source.x, haul.source.y, true, removeCode, "run", owner.index, self.shipName, haul.source.factionIndex or owner.index, haul.source.name, good, amount, self.data.commandToken, tr.id, self.data.callingPlayer)
-end
-
 function StockFactoryCommand:onGoodsRemoved(commandToken, transactionId, good, removed)
-    local owner = getParentFaction()
-    local haul = self.data.currentHaul
-    local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "removing" then return end
+    local transaction = self:acceptReply(commandToken, transactionId, good, "removing")
+    if not transaction then return end
 
     if (removed or 0) <= 0 then
-        -- source was empty at transfer time (produced nothing yet)
-        -- retry with a different random pair soon
-        self:noteHaulFailure("source", good, haul.source)
-        self:abandonTransfer(5)
+        -- the producer's bay held less than the plan said; nothing left it, so nothing to undo
+        print(string.format("StockFactory: '%s' picked up no %s at '%s' - looking for another pair",
+            tostring(self.shipName), tostring(good), tostring(self.data.currentHaul.source.name)))
+
+        self:abandonTransfer(FailedHaulRetrySeconds)
         return
     end
 
@@ -1051,44 +879,93 @@ function StockFactoryCommand:onGoodsRemoved(commandToken, transactionId, good, r
     transaction.amount = removed
     self.data.timer = 0
 
-    local t = haul.target
+    local owner = getParentFaction()
+    local t = self.data.currentHaul.target
     runSectorCode(t.x, t.y, true, addCode, "run", owner.index, self.shipName, t.factionIndex or owner.index, t.name, good, removed, self.data.commandToken, transactionId, self.data.callingPlayer)
-
-    print(string.format("StockFactory: '%s' moving #%i - %i units of %s from '%s' (%i:%i) to '%s' (%i:%i)",
-        tostring(self.shipName), transactionId, removed, tostring(good),
-        tostring(haul.source.name), haul.source.x, haul.source.y, tostring(t.name), t.x, t.y))
 end
 
 function StockFactoryCommand:onGoodsDelivered(commandToken, transactionId, good, added, notAdded)
-    local owner = getParentFaction()
+    local transaction = self:acceptReply(commandToken, transactionId, good, "delivering")
+    if not transaction then return end
+
     local haul = self.data.currentHaul
-    local transaction = self.data.transaction
-    if self.data.commandToken ~= commandToken or not haul or not transaction or transaction.id ~= transactionId or transaction.good ~= good or transaction.stage ~= "delivering" then return end
+    transaction.delivered = added or 0
 
-    if (added or 0) > 0 then
-        owner:sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% transferred %4% %5% from %6% to %7%."%_T,
-            haul.target.x, haul.target.y, self.shipName, added, goodDisplayName(good, added),
+    if transaction.delivered > 0 then
+        getParentFaction():sendChatMessage("", ChatMessageType.Economy, "(%1%:%2%) %3% transferred %4% %5% from %6% to %7%."%_T,
+            haul.target.x, haul.target.y, self.shipName, transaction.delivered, goodDisplayName(good, transaction.delivered),
             haul.source.name, haul.target.name)
-
-        self:clearSourceFailures(haul.target)
     end
 
-    if (notAdded or 0) > 0 then
-        -- the bay took less than we sized the haul for: usually it is physically full of
-        -- other goods, but another hauler can also have taken the last of the room in the
-        -- same few frames. Nothing is destroyed, the remainder goes back to the producer.
-        print(string.format("StockFactory: '%s' returned %i units of %s to '%s' - '%s' only took %i",
-            tostring(self.shipName), notAdded, tostring(good), tostring(haul.source.name),
-            tostring(haul.target.name), added or 0))
-
-        self:noteHaulFailure("target", good, haul.target)
-
-        local s = haul.source
-        runSectorCode(s.x, s.y, true, returnCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, good, notAdded)
+    if (notAdded or 0) <= 0 then
+        self:finishHaul()
+        return
     end
 
-    -- no trip home: the next run's travel leg already covers target -> next source
-    self:abandonTransfer(0)
+    -- the bay took less than the plan sized the haul for: usually it filled up with something
+    -- else in the meantime. The remainder goes straight back where it came from.
+    print(string.format("StockFactory: '%s' giving %i units of %s back to '%s' - '%s' only took %i",
+        tostring(self.shipName), notAdded, tostring(good), tostring(haul.source.name),
+        tostring(haul.target.name), transaction.delivered))
+
+    transaction.stage = "returning"
+    self.data.timer = 0
+
+    local owner = getParentFaction()
+    local s = haul.source
+    runSectorCode(s.x, s.y, true, returnCode, "run", owner.index, self.shipName, s.factionIndex or owner.index, s.name, good, notAdded, self.data.commandToken, transactionId)
+end
+
+-- The producer normally takes the remainder straight back. When it can't, the goods have
+-- nowhere left to go but the ship's own hold, and a hauler flying around with cargo it cannot
+-- put down is not something it can resolve on its own -- so that ends the run for good.
+function StockFactoryCommand:onGoodsReturned(commandToken, transactionId, good, returned, lost)
+    local transaction = self:acceptReply(commandToken, transactionId, good, "returning")
+    if not transaction then return end
+
+    if (lost or 0) <= 0 then
+        self:finishHaul()
+        return
+    end
+
+    self:stowOnShip(good, lost)
+    self:setRuntimeError("Commander, %1% wouldn't take %2% %3% back and I'm carrying it. Bringing it home."%_T,
+        self.data.currentHaul.source.name, lost, goodDisplayName(good, lost))
+end
+
+-- A run that moved something earns its travel leg; one that moved nothing just picks another
+-- pair, having cost nothing but a few seconds.
+function StockFactoryCommand:finishHaul()
+    if (self.data.transaction.delivered or 0) <= 0 then
+        self:abandonTransfer(FailedHaulRetrySeconds)
+        return
+    end
+
+    self.data.currentHaul.travelTime = self:estimateTravelTime()
+    self.data.transaction = nil
+    self.data.phase = "travelling"
+    self.data.timer = 0
+end
+
+-- Last resort for goods neither station will hold. The haul was sized against the ship's free
+-- space in the first place, so the hold has room for them unless something else filled it.
+function StockFactoryCommand:stowOnShip(goodName, amount)
+    local good = goods[goodName]
+    local entry = ShipDatabaseEntry(getParentFaction().index, self.shipName)
+    if not good or not valid(entry) then return end
+
+    local cargo = entry:getCargo()
+    local exact = good:good()
+
+    for held, heldAmount in pairs(cargo) do
+        if held.name == exact.name and not held.stolen and not held.illegal then
+            exact, amount = held, heldAmount + amount
+            break
+        end
+    end
+
+    cargo[exact] = amount
+    entry:setCargo(cargo)
 end
 
 function StockFactoryCommand:transactionError(commandToken, transactionId, msg, ...)
@@ -1261,14 +1138,24 @@ end
 
 -- Reading a station's secured script values deserialises its whole trading state, so the
 -- parsed offer is cached briefly and dropped wholesale once it ages out. Every running
--- command remaps in the same simulation tick and would otherwise repeat the same scan.
+-- command plans in the same simulation tick and would otherwise repeat the same scan.
 local stationTradeCache = {}
 local stationTradeCacheTime
+
+-- Resolved on every call rather than at load: this module is included by commandfactory.lua,
+-- which simulation.lua includes before it declares the Simulation namespace, so the function
+-- does not exist yet while this file is being read.
+local function stationTradeCacheSeconds()
+    local ok, interval = pcall(function() return Simulation.getUpdateInterval() end)
+    if not ok or type(interval) ~= "number" or interval <= 0 then interval = DefaultTickSeconds end
+
+    return interval * StationTradeCacheTickFraction
+end
 
 local function beginStationScan()
     local ok, runtime = pcall(function() return Server().unpausedRuntime end)
 
-    if not ok or not stationTradeCacheTime or runtime - stationTradeCacheTime >= StationTradeCacheSeconds then
+    if not ok or not stationTradeCacheTime or runtime - stationTradeCacheTime >= stationTradeCacheSeconds() then
         stationTradeCache = {}
         stationTradeCacheTime = ok and runtime or nil
     end
@@ -1286,6 +1173,8 @@ local function readStationTrade(entry, cacheKey, tradeScripts)
     local hasTrade = false
     local pickupEnabled  = true
     local deliveryEnabled = true
+    -- vanilla splits a station's bay evenly across its trade slots, so the offer sizes count
+    local tradeSlots = 0
 
     for i, script in pairs(scripts) do
         local isTrade = false
@@ -1313,11 +1202,13 @@ local function readStationTrade(entry, cacheKey, tradeScripts)
 
             for _, good in pairs(soldGoods or {}) do
                 sells[good.name] = script
+                tradeSlots = tradeSlots + 1
                 hasTrade = true
             end
 
             for _, good in pairs(boughtGoods or {}) do
                 buys[good.name] = script
+                tradeSlots = tradeSlots + 1
                 hasTrade = true
             end
 
@@ -1346,9 +1237,24 @@ local function readStationTrade(entry, cacheKey, tradeScripts)
         end
     end
 
+    -- What is actually in the bay, read straight off the database entry: no sector has to be
+    -- loaded for this, which is what lets a haul be sized before the ship commits to it.
+    -- Cargo is keyed by exact trading good, so stolen and illegal variants stay uncounted.
+    local stock = {}
+    local cargo, baySize = entry:getCargo()
+    for good, amount in pairs(cargo or {}) do
+        if not good.stolen and not good.illegal then
+            stock[good.name] = (stock[good.name] or 0) + amount
+        end
+    end
+
     local trade = hasTrade and {
         buys = buys,
         sells = sells,
+        stock = stock,
+        baySize = baySize or 0,
+        freeSpace = entry:getFreeCargoSpace() or -1,
+        tradeSlots = tradeSlots,
         stockHaulerPickupEnabled   = pickupEnabled,
         stockHaulerDeliveryEnabled = deliveryEnabled,
     } or false
@@ -1409,6 +1315,8 @@ local function gatherOwnedTradingStations(owner, reachable, callingPlayer)
                     table.insert(stations, {
                         name = name, factionIndex = faction.index, x = x, y = y,
                         buys = trade.buys, sells = trade.sells,
+                        stock = trade.stock, baySize = trade.baySize,
+                        freeSpace = trade.freeSpace, tradeSlots = trade.tradeSlots,
                         stockHaulerPickupEnabled   = trade.stockHaulerPickupEnabled,
                         stockHaulerDeliveryEnabled = trade.stockHaulerDeliveryEnabled,
                     })
@@ -1465,14 +1373,12 @@ end
 
 
 ---------------------------------------------------------------------
--- periodic re-mapping + failure handling
+-- periodic re-mapping
 ---------------------------------------------------------------------
 
 -- true if at least one good can still be sourced from a reachable owned supplier
-function StockFactoryCommand:hasAnyReachableSource(index)
-    index = index or buildRouteIndex(self.data.stations, self.config)
-
-    for _, entry in pairs(index) do
+function StockFactoryCommand:hasAnyReachableSource()
+    for _, entry in pairs(buildRouteIndex(self.data.stations)) do
         if #entry.targets > 0 and #entry.sources > 0 then
             return true
         end
@@ -1481,23 +1387,18 @@ function StockFactoryCommand:hasAnyReachableSource(index)
     return false
 end
 
--- returns true when at least one consumer exists for any eligible good
-function StockFactoryCommand:hasAnyConsumer(index)
-    index = index or buildRouteIndex(self.data.stations, self.config)
+-- Re-reads what the owned stations in range offer and hold. Cheap enough to run before every
+-- plan, and shared with every other command that plans in the same tick.
+function StockFactoryCommand:refreshStations()
+    local owner = getParentFaction()
+    if not owner then return end
 
-    for _, entry in pairs(index) do
-        if #entry.targets > 0 then
-            return true
-        end
-    end
-
-    return false
+    self.data.stations = gatherOwnedTradingStations(owner, self.data.reachable, self.data.callingPlayer)
 end
 
--- re-scan owned stations and recompute the reachable region + gate route from the
--- target, so the command follows the galaxy over time (gates turning hostile,
--- suppliers built or destroyed). Finding nothing is not a failure: the ship stays
--- assigned and idles until a route appears.
+-- Recompute the reachable region + gate route from the anchor, so the command follows the
+-- galaxy over time (gates turning hostile, suppliers built or destroyed). Finding nothing is
+-- not a failure: the ship stays assigned and idles until a route appears.
 function StockFactoryCommand:remapRoute()
     local owner = getParentFaction()
     local anchor = self.data.anchor
@@ -1516,7 +1417,7 @@ function StockFactoryCommand:remapRoute()
     local reachable, gateCameFrom = computeReachableRegion(owner, anchor.x, anchor.y)
     self.data.reachable = reachable
     self.data.gateCameFrom = gateCameFrom
-    self.data.stations = gatherOwnedTradingStations(owner, reachable, self.data.callingPlayer)
+    self:refreshStations()
 end
 
 
@@ -1601,12 +1502,12 @@ end
 -- ferry visuals
 ---------------------------------------------------------------------
 --
--- A run is split into two windows. During the first the ferry travels: it patrols transit
--- sectors along the gate route and, on some runs, makes a decorative stop at the producer.
--- During the second it is parked at the consumer's sector so a watching player sees it fly
--- in and dock just as the transfer resolves.
+-- The cargo changes hands in the producer's sector, and the ferry flies the load out from
+-- there: it is docked at the producer while the transfer resolves, patrols the transit
+-- sectors on its gate route, then parks at the consumer for the tail of the leg so a watching
+-- player sees it fly in and dock.
 
--- start of the delivery approach, as an offset into the run
+-- start of the delivery approach, as an offset into the leg
 function StockFactoryCommand:approachStart()
     local haul = self.data.currentHaul
     if not haul then return 0 end
@@ -1620,20 +1521,6 @@ function StockFactoryCommand:isApproaching()
     return (self.data.timer or 0) >= self:approachStart()
 end
 
--- True while a spawned ferry has recently reported in from the consumer's sector. The AI
--- script only runs on an appearance, and appearances only spawn where a player is, so this
--- doubles as "someone is watching the delivery".
-function StockFactoryCommand:ferryIsApproachingTarget()
-    local haul = self.data.currentHaul
-    local seen = self.data.ferrySector
-    if not haul or not seen then return false end
-
-    if seen.x ~= haul.target.x or seen.y ~= haul.target.y then return false end
-
-    local age = (self.data.clock or 0) - (seen.clock or 0)
-    return age >= 0 and age <= ApproachSeconds + DockGraceSeconds
-end
-
 -- Where the appearance system should place the ferry. Returning nil means "nowhere", which
 -- vanilla treats as no appearance this tick.
 function StockFactoryCommand:getAppearanceSector()
@@ -1645,15 +1532,15 @@ function StockFactoryCommand:getAppearanceSector()
         return nil
     end
 
-    if self:isApproaching() or self.data.phase == "transferring" then
-        return haul.target.x, haul.target.y
-    end
-
-    if haul.visitSource then
+    if self.data.phase == "transferring" then
         return haul.source.x, haul.source.y
     end
 
-    -- somewhere along the gate route, advancing with the run so the trip reads as a trip
+    if self:isApproaching() then
+        return haul.target.x, haul.target.y
+    end
+
+    -- somewhere along the gate route, advancing with the leg so the trip reads as a trip
     local path = routePath(self.data.gateCameFrom or {}, anchor.x, anchor.y,
         haul.source.x, haul.source.y, haul.target.x, haul.target.y)
 
@@ -1678,26 +1565,19 @@ function StockFactoryCommand:computeFerryNextHop(sx, sy)
     local anchor = self.data.anchor or {}
 
     local destX, destY = haul.target.x, haul.target.y
-    if not self:isApproaching() and phase == "travelling" and haul.visitSource then
-        destX, destY = haul.source.x, haul.source.y
-    end
+    if phase == "transferring" then destX, destY = haul.source.x, haul.source.y end
 
     return nextHopOnTree(cameFrom, anchor.x, anchor.y, sx, sy, destX, destY)
 end
 
--- The consumer is the only stop that matters, and docking it is what triggers the transfer.
--- The producer stop is decorative and only offered on runs that rolled for it.
+-- The ferry is loading at the producer while the transfer resolves, and unloading at the
+-- consumer once it has flown the leg. In between there is nothing to dock with.
 function StockFactoryCommand:getFerryDockTarget()
     local haul = self.data.currentHaul
     if not haul then return nil end
 
-    if self:isApproaching() or self.data.phase == "transferring" then
-        return haul.target
-    end
-
-    if self.data.phase == "travelling" and haul.visitSource then
-        return haul.source
-    end
+    if self.data.phase == "transferring" then return haul.source end
+    if self:isApproaching() then return haul.target end
 
     return nil
 end
@@ -1711,24 +1591,11 @@ function StockFactoryCommand:ferryTransitLinger()
     return math.max(0, math.min(MaxTransitLinger, slack))
 end
 
--- Reported by the ferry AI the moment it finishes docking. Landing on the consumer during
--- the approach window is what makes the transfer message coincide with the visible dock.
-function StockFactoryCommand:onFerryDocked(x, y, stationName)
-    local haul = self.data.currentHaul
-    if not haul or self.data.phase ~= "travelling" then return end
-    if haul.target.x ~= x or haul.target.y ~= y or haul.target.name ~= stationName then return end
-    if not self:isApproaching() then return end
-
-    self:beginTransfer()
-end
-
 -- invoked by the ferry appearance to learn which gate to use; replies straight
 -- back into the ferry's sector via runSectorCode
 function StockFactoryCommand:onFerryRouteRequest(sx, sy)
     local owner = getParentFaction()
     if not owner then return end
-
-    self.data.ferrySector = {x = sx, y = sy, clock = self.data.clock or 0}
 
     local nextX, nextY, useGate = self:computeFerryNextHop(sx, sy)
     local dockTarget = self:getFerryDockTarget()
@@ -1756,10 +1623,10 @@ end
 function StockFactoryCommand:getDescriptionText()
     local anchor = self.data and self.data.anchor
     if anchor then
-        return "The ship is stocking your stations in the anchor region around (${x}:${y}), moving all eligible goods between your own producers and consumers (except any you have added to the ignore list)."%_T, {x = anchor.x, y = anchor.y}
+        return "The ship is stocking your stations in the anchor region around (${x}:${y}), moving goods between your own producers and consumers in the order you asked for."%_T, {x = anchor.x, y = anchor.y}
     end
 
-    return "The ship is stocking your stations in the anchor region, moving all eligible goods between your own producers and consumers."%_T
+    return "The ship is stocking your stations in the anchor region, moving goods between your own producers and consumers in the order you asked for."%_T
 end
 
 function StockFactoryCommand:getStatusMessage()
@@ -1808,7 +1675,7 @@ function StockFactoryCommand:getAreaSelectionTooltip(ownerIndex, shipName, area,
 end
 
 function StockFactoryCommand:getConfigurableValues(ownerIndex, shipName)
-    return {ignoredGoods = {default = {}}}
+    return {priority = {displayName = "Prioritize"%_t, from = 1, to = 5, default = HaulPriority.Random}}
 end
 
 function StockFactoryCommand:getPredictableValues()
@@ -1829,7 +1696,7 @@ function StockFactoryCommand:calculatePrediction(ownerIndex, shipName, area, con
     local analysis = area.analysis or {}
     local stations = analysis.stations or {}
 
-    local index = buildRouteIndex(stations, config)
+    local index = buildRouteIndex(stations)
 
     local producerStations = {}
     local consumerStations = {}
@@ -1906,7 +1773,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.window = GalaxyMap():createWindow(Rect(size))
     ui.window.caption = "Stock Factory"%_t
 
-    local settings = {areaHeight = 110, configHeight = 180, hideEscortUI = true}
+    local settings = {areaHeight = 110, configHeight = 90, hideEscortUI = true}
     ui.commonUI = SimulationUtility.buildCommandUI(ui.window, startPressedCallback, changeAreaPressedCallback, recallPressedCallback, configChangedCallback, settings)
 
     -- brief "how it works" description, shown in the top-right panel (the space
@@ -1922,86 +1789,24 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.descriptionField.padding = 4
     ui.descriptionField.text =
         "Anchors to one sector and operates in that sector plus sectors up to 5 gate jumps away."%_t .. "\n\n" ..
-        "The ship automatically hauls all eligible goods it can find source-target pairs for."%_t .. "\n\n" ..
-        "It never hauls more than a consumer station needs, and never takes a good from a station that also buys it.\n\nUse the toggle buttons on station buy/sell tabs to exclude individual stations."%_t
+        "The ship reads what every station in range holds, then moves whichever load its own setting favours. It never hauls more than a consumer needs, and never takes a good from a station that also buys it."%_t .. "\n\n" ..
+        "Use the toggle buttons on station buy/sell tabs to exclude individual stations."%_t
 
-    -- config: anchor sector and goods denylist
+    -- config: anchor sector and haul priority
     local configRect = ui.commonUI.configRect
     local vlist = UIVerticalLister(configRect, 8, 0)
 
-    local headerRect = vlist:nextRect(20)
-    local headerSplit = UIVerticalSplitter(headerRect, 8, 0, 0.35)
+    local headerSplit = UIVerticalSplitter(vlist:nextRect(20), 8, 0, 0.35)
     ui.window:createLabel(headerSplit.left, "Anchor Sector:"%_t, 13)
     ui.anchorSectorLabel = ui.window:createLabel(headerSplit.right, ""%_t, 13)
     ui.anchorSectorLabel:setCenterAligned()
 
-    ui.window:createLabel(vlist:nextRect(18), "Ignored Goods:"%_t, 13)
-
-    local editorRect = vlist:nextRect(28)
-    local editorSplit = UIVerticalSplitter(editorRect, 6, 0, 0.82)
-    ui.goodCombo = ui.window:createValueComboBox(editorSplit.left, "")
-    ui.goodCombo.height = 26
-
-    local buttonSplit = UIVerticalSplitter(editorSplit.right, 4, 0, 0.5)
-    ui.addIgnoredGoodButton = ui.window:createButton(buttonSplit.left, "", "stockFactoryAddIgnoredGood")
-    ui.addIgnoredGoodButton.icon = "data/textures/icons/plus.png"
-    ui.addIgnoredGoodButton.tooltip = "Ignore the selected good."%_t
-    ui.removeIgnoredGoodButton = ui.window:createButton(buttonSplit.right, "", "stockFactoryRemoveIgnoredGood")
-    ui.removeIgnoredGoodButton.icon = "data/textures/icons/minus.png"
-    ui.removeIgnoredGoodButton.tooltip = "Haul the selected ignored good again."%_t
-
-    ui.ignoredGoodsList = ui.window:createListBox(vlist:nextRect(82))
-    ui.ignoredGoodsList.rowHeight = 20
-    ui.ignoredGoods = {}
-
-    ui.refreshGoods = function(self, area, config)
-        self.ignoredGoods = {}
-        local configuredGoods = config and config.ignoredGoods
-        if type(configuredGoods) ~= "table" then configuredGoods = {} end
-        for name, ignored in pairs(configuredGoods) do
-            if ignored then self.ignoredGoods[name] = true end
-        end
-
-        local available = {}
-        local stations = area and area.analysis and area.analysis.stations or {}
-        for name, _ in pairs(allStationGoods(stations)) do
-            if not self.ignoredGoods[name] then table.insert(available, name) end
-        end
-        table.sort(available, function(a, b) return goodDisplayName(a, 1) < goodDisplayName(b, 1) end)
-
-        self.goodCombo:clear()
-        self.goodCombo:addEntry("", "")
-        for _, name in pairs(available) do
-            self.goodCombo:addEntry(name, goodDisplayName(name, 1))
-        end
-        self.goodCombo:setSelectedValueNoCallback("")
-
-        local ignored = {}
-        for name, _ in pairs(self.ignoredGoods) do table.insert(ignored, name) end
-        table.sort(ignored, function(a, b) return goodDisplayName(a, 1) < goodDisplayName(b, 1) end)
-
-        self.ignoredGoodsList:clear()
-        for _, name in pairs(ignored) do
-            self.ignoredGoodsList:addEntry(goodDisplayName(name, 1), name)
-        end
-    end
-
-    self.mapCommands.stockFactoryAddIgnoredGood = function()
-        local name = ui.goodCombo.selectedValue
-        if not name or name == "" then return end
-
-        ui.ignoredGoods[name] = true
-        ui:refreshGoods(ui.currentArea, {ignoredGoods = ui.ignoredGoods})
-        self.mapCommands[configChangedCallback]()
-    end
-
-    self.mapCommands.stockFactoryRemoveIgnoredGood = function()
-        local name = ui.ignoredGoodsList.selectedValue
-        if not name or name == "" then return end
-
-        ui.ignoredGoods[name] = nil
-        ui:refreshGoods(ui.currentArea, {ignoredGoods = ui.ignoredGoods})
-        self.mapCommands[configChangedCallback]()
+    local prioritySplit = UIVerticalSplitter(vlist:nextRect(26), 8, 0, 0.35)
+    ui.window:createLabel(prioritySplit.left, "Prioritize:"%_t, 13)
+    ui.priorityCombo = ui.window:createValueComboBox(prioritySplit.right, configChangedCallback)
+    ui.priorityCombo.tooltip = "Which of the loads it could move this ship should reach for first. Total value is the units moved times the good's base price; total volume is the units moved times the good's cargo volume.\n\nWith no preference it picks at random. Give haulers working the same region different settings and they will stop competing for the same cargo."%_t
+    for value = 1, #HaulPriorityNames do
+        ui.priorityCombo:addEntry(value, HaulPriorityNames[value])
     end
 
     -- prediction panel
@@ -2042,9 +1847,7 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     ui.clear = function(self, shipName)
         self.commonUI:clear(shipName)
         self.anchorSectorLabel.caption = ""
-        self.goodCombo:clear()
-        self.ignoredGoodsList:clear()
-        self.ignoredGoods = {}
+        self.priorityCombo:setSelectedValueNoCallback(HaulPriority.Random)
         self.currentArea = nil
     end
 
@@ -2058,18 +1861,14 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
             self.anchorSectorLabel.caption = ""
         end
 
-        self:refreshGoods(area, config or {ignoredGoods = self.ignoredGoods})
+        self.priorityCombo:setSelectedValueNoCallback(tonumber(config and config.priority) or HaulPriority.Random)
     end
 
     ui.refresh = function(self, ownerIndex, shipName, area, config)
         self.commonUI:refresh(ownerIndex, shipName, area, config)
 
-        if not config then
-            self:refreshInputs(ownerIndex, shipName, area, {ignoredGoods = {}})
-            config = self:buildConfig()
-        else
-            self:refreshInputs(ownerIndex, shipName, area, config)
-        end
+        self:refreshInputs(ownerIndex, shipName, area, config)
+        config = config or self:buildConfig()
 
         self:refreshPredictions(ownerIndex, shipName, area, config)
     end
@@ -2092,24 +1891,19 @@ function StockFactoryCommand:buildUI(startPressedCallback, changeAreaPressedCall
     end
 
     ui.buildConfig = function(self)
-        local config = {}
-        config.escorts = self.commonUI.escortUI:buildConfig()
-        config.ignoredGoods = {}
-        for name, ignored in pairs(self.ignoredGoods or {}) do
-            if ignored then config.ignoredGoods[name] = true end
-        end
-        return config
+        return {
+            escorts = self.commonUI.escortUI:buildConfig(),
+            priority = tonumber(self.priorityCombo.selectedValue) or HaulPriority.Random,
+        }
     end
 
     ui.displayConfig = function(self, config, ownerIndex)
-        self:refreshGoods(self.currentArea, config)
+        self.priorityCombo:setSelectedValueNoCallback(tonumber(config and config.priority) or HaulPriority.Random)
     end
 
     ui.setActive = function(self, active, description)
         self.commonUI:setActive(active, description)
-        self.goodCombo.active = active
-        self.addIgnoredGoodButton.active = active
-        self.removeIgnoredGoodButton.active = active
+        self.priorityCombo.active = active
     end
 
     ui.onWindowClosed = function(self)
@@ -2121,6 +1915,6 @@ end
 
 -- The sector jobs run in throwaway Lua states and are never called directly, so they are
 -- exposed here purely so the tests can load and exercise them.
-local sectorCode = {probe = probeCode, remove = removeCode, add = addCode, returnGoods = returnCode}
+local sectorCode = {remove = removeCode, add = addCode, returnGoods = returnCode}
 
 return setmetatable({new = new, sectorCode = sectorCode}, {__call = function(_, ...) return new(...) end})
